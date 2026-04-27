@@ -1,0 +1,13 @@
+{
+  "name": "zeromem",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "compile": "npm run compile --workspaces --if-present"
+  }
+}

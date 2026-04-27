@@ -1,0 +1,19 @@
+{
+  "name": "@zeromem/openclaw",
+  "version": "0.1.0",
+  "description": "ZeroMem drop-in plugin for OpenClaw agents (Vercel AI SDK compatible)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "peerDependencies": {
+    "ai": ">=3.0.0",
+    "@zeromem/sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  }
+}

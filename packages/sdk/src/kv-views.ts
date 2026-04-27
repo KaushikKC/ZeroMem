@@ -1,0 +1,194 @@
+import { StorageClient } from './storage.js';
+
+/** Namespaced KV keys for an agent */
+export class KvViews {
+  private streamId: string;
+
+  constructor(private storage: StorageClient, agentAddress: string) {
+    this.streamId = StorageClient.streamId(agentAddress);
+  }
+
+  // ── HEAD pointers ──────────────────────────────────────────────────────────
+
+  headKey(agentId: string, branch: string): string {
+    return `head/${agentId}/${branch}`;
+  }
+
+  async getHead(agentId: string, branch: string): Promise<string | null> {
+    const val = await this.storage.kvGet(this.streamId, this.headKey(agentId, branch));
+    if (!val) return null;
+    return new TextDecoder().decode(val);
+  }
+
+  async setHead(agentId: string, branch: string, commitId: string): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.headKey(agentId, branch),
+        value: new TextEncoder().encode(commitId),
+      },
+    ]);
+  }
+
+  // ── Vector index shards ────────────────────────────────────────────────────
+
+  shardKey(agentId: string, ns: string, shard: number): string {
+    return `idx/${agentId}/${ns}/v/${shard}`;
+  }
+
+  async getShardCount(agentId: string, ns: string): Promise<number> {
+    const val = await this.storage.kvGet(
+      this.streamId,
+      `idx/${agentId}/${ns}/shards`
+    );
+    if (!val) return 0;
+    return parseInt(new TextDecoder().decode(val), 10);
+  }
+
+  async getShard<T>(agentId: string, ns: string, shard: number): Promise<T[]> {
+    const val = await this.storage.kvGet(
+      this.streamId,
+      this.shardKey(agentId, ns, shard)
+    );
+    if (!val) return [];
+    return JSON.parse(new TextDecoder().decode(val)) as T[];
+  }
+
+  async appendToShard<T>(
+    agentId: string,
+    ns: string,
+    shard: number,
+    entries: T[],
+    maxPerShard = 256
+  ): Promise<void> {
+    const existing = await this.getShard<T>(agentId, ns, shard);
+    const updated = [...existing, ...entries].slice(-maxPerShard);
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.shardKey(agentId, ns, shard),
+        value: new TextEncoder().encode(JSON.stringify(updated)),
+      },
+    ]);
+  }
+
+  async writeAll(
+    agentId: string,
+    ns: string,
+    shard: number,
+    entries: unknown[]
+  ): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.shardKey(agentId, ns, shard),
+        value: new TextEncoder().encode(JSON.stringify(entries)),
+      },
+    ]);
+  }
+
+  // ── Grant views ────────────────────────────────────────────────────────────
+
+  grantKey(from: string, to: string, scope: string): string {
+    return `grant/${from}/${to}/${scope}`;
+  }
+
+  async setGrant(
+    from: string,
+    to: string,
+    scope: string,
+    grantId: string,
+    ttl: number
+  ): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.grantKey(from, to, scope),
+        value: new TextEncoder().encode(JSON.stringify({ grantId, ttl })),
+      },
+    ]);
+  }
+
+  async getGrant(
+    from: string,
+    to: string,
+    scope: string
+  ): Promise<{ grantId: string; ttl: number } | null> {
+    const val = await this.storage.kvGet(
+      this.streamId,
+      this.grantKey(from, to, scope)
+    );
+    if (!val) return null;
+    return JSON.parse(new TextDecoder().decode(val));
+  }
+
+  async removeGrant(from: string, to: string, scope: string): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.grantKey(from, to, scope),
+        value: new TextEncoder().encode('null'),
+      },
+    ]);
+  }
+
+  // ── Skill blobs ────────────────────────────────────────────────────────────
+
+  skillKey(agentId: string, name: string): string {
+    return `skill/${agentId}/${name}`;
+  }
+
+  async setSkill(agentId: string, name: string, blobRoot: string): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.skillKey(agentId, name),
+        value: new TextEncoder().encode(blobRoot),
+      },
+    ]);
+  }
+
+  async getSkill(agentId: string, name: string): Promise<string | null> {
+    const val = await this.storage.kvGet(this.streamId, this.skillKey(agentId, name));
+    if (!val) return null;
+    return new TextDecoder().decode(val);
+  }
+
+  // ── Tombstones (forget) ────────────────────────────────────────────────────
+
+  tombKey(agentId: string, commitId: string): string {
+    return `tomb/${agentId}/${commitId}`;
+  }
+
+  async setTomb(agentId: string, commitId: string): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.tombKey(agentId, commitId),
+        value: new TextEncoder().encode('1'),
+      },
+    ]);
+  }
+
+  async isTombed(agentId: string, commitId: string): Promise<boolean> {
+    const val = await this.storage.kvGet(this.streamId, this.tombKey(agentId, commitId));
+    return val !== null && new TextDecoder().decode(val) === '1';
+  }
+
+  // ── Branch list ────────────────────────────────────────────────────────────
+
+  branchListKey(agentId: string): string {
+    return `branches/${agentId}`;
+  }
+
+  async getBranches(agentId: string): Promise<string[]> {
+    const val = await this.storage.kvGet(this.streamId, this.branchListKey(agentId));
+    if (!val) return [];
+    return JSON.parse(new TextDecoder().decode(val)) as string[];
+  }
+
+  async addBranch(agentId: string, branch: string): Promise<void> {
+    const existing = await this.getBranches(agentId);
+    if (!existing.includes(branch)) {
+      await this.storage.kvSet(this.streamId, [
+        {
+          key: this.branchListKey(agentId),
+          value: new TextEncoder().encode(JSON.stringify([...existing, branch])),
+        },
+      ]);
+    }
+  }
+}

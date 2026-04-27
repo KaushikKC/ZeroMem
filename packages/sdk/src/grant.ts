@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
+import { KvViews } from './kv-views.js';
 import type { StorageClient } from './storage.js';
-import type { KvViews } from './kv-views.js';
 import type { GrantRecord } from './types.js';
 
 const GRANT_REGISTRY_ABI = [
@@ -24,7 +24,11 @@ function ttlToTimestamp(ttl: string): bigint {
   if (!m) throw new Error(`Invalid TTL format: ${ttl}. Use e.g. 24h, 30m, 7d`);
   const n = BigInt(m[1]);
   const unit = m[2];
-  const secs = unit === 's' ? n : unit === 'm' ? n * 60n : unit === 'h' ? n * 3600n : n * 86400n;
+  const secs =
+    unit === 's' ? n :
+    unit === 'm' ? n * 60n :
+    unit === 'h' ? n * 3600n :
+    n * 86400n;
   return now + secs;
 }
 
@@ -55,23 +59,25 @@ export class GrantManager {
     return this.contract;
   }
 
-  /** Register agent's public key on-chain */
   async registerAgent(pubkey: string): Promise<void> {
     try {
       const contract = this.getContract();
       const tx = await contract.registerAgent(pubkey);
       await tx.wait();
     } catch {
-      // skip if no contract deployed yet
+      // no contract deployed yet — silently skip
     }
   }
 
   /**
-   * Grant access to a scope of memory to another agent.
-   * Re-uploads the payload encrypted to the recipient's pubkey.
+   * Grant read access to a memory scope.
+   * - Re-uploads head commit payload encrypted to recipient pubkey
+   * - Writes grant record into granter's KV stream (this.kv = granter's)
+   * - Optionally records on-chain via GrantRegistry
    */
   async createGrant(opts: {
     from: string;
+    granterAgentId: string;
     to: string;
     toPubKey: string;
     scope: string;
@@ -79,7 +85,7 @@ export class GrantManager {
     headCommitId: string;
     privateKey: string;
   }): Promise<string> {
-    const { from, to, toPubKey, scope, ttl, headCommitId, privateKey } = opts;
+    const { from, granterAgentId, to, toPubKey, scope, ttl, headCommitId, privateKey } = opts;
 
     // Re-encrypt head commit for recipient
     const data = await this.storage.download(headCommitId, { privateKey });
@@ -101,66 +107,69 @@ export class GrantManager {
       const tx = await contract.grant(to, sh, ttlTimestamp, commitRootBytes);
       const receipt = await tx.wait();
       const event = receipt.logs
-        .map((l: any) => { try { return contract.interface.parseLog(l); } catch { return null; } })
+        .map((l: any) => {
+          try { return contract.interface.parseLog(l); } catch { return null; }
+        })
         .find((e: any) => e?.name === 'GrantCreated');
-      grantId = event?.args?.grantId ?? ethers.keccak256(ethers.toUtf8Bytes(`${from}:${to}:${scope}:${Date.now()}`));
+      grantId =
+        event?.args?.grantId ??
+        ethers.keccak256(ethers.toUtf8Bytes(`${from}:${to}:${scope}:${Date.now()}`));
     } catch {
       grantId = ethers.keccak256(
         ethers.toUtf8Bytes(`${from}:${to}:${scope}:${Date.now()}`)
       );
     }
 
-    const record: GrantRecord = {
-      grantId,
-      from,
-      to,
-      scope,
-      ttl: Number(ttlTimestamp),
-      commitRoot: headCommitId,
-      payloadRoot,
-      createdAt: Date.now(),
-    };
-
-    // Store grant record in KV for both parties
-    await this.kv.setGrant(from, to, scope, grantId, Number(ttlTimestamp));
-
-    // Store full grant record as blob
-    const grantData = new TextEncoder().encode(JSON.stringify(record));
-    await this.storage.upload(grantData, {
-      encrypt: true,
-      recipientPubKey: this.storage.pubKey,
-    });
+    // Write to granter's KV stream (this.kv is always the granter's)
+    await this.kv.setGrant(from, to, scope, grantId, Number(ttlTimestamp), granterAgentId);
 
     return grantId;
   }
 
-  /** Revoke a grant */
-  async revoke(grantId: string): Promise<void> {
+  /** Revoke a grant — removes from granter's KV + on-chain */
+  async revoke(grantId: string, scope: string, to: string): Promise<void> {
     try {
       const contract = this.getContract();
       const tx = await contract.revoke(grantId);
       await tx.wait();
     } catch {
-      // contract may not be deployed
+      // no contract
     }
-    // Find and remove from KV (search by grantId)
-    // For now we mark the grantId as revoked in KV
-    await this.storage.upload(
-      new TextEncoder().encode(JSON.stringify({ revoked: true, grantId })),
-      { encrypt: true, recipientPubKey: this.storage.pubKey }
-    );
+    // Remove from granter's KV stream
+    await this.kv.removeGrant(this.wallet.address, to, scope);
   }
 
-  /** Check if a grant is still valid */
+  /**
+   * Check if a grant is valid.
+   * Reads from the GRANTER's KV stream (keyed by `from` address).
+   */
   async isGranted(from: string, to: string, scope: string): Promise<boolean> {
-    const record = await this.kv.getGrant(from, to, scope);
+    // Read from granter's KV stream, not the local (recipient's) stream
+    const grantorKv = new KvViews(this.storage, from);
+    const record = await grantorKv.getGrant(from, to, scope);
+
     if (!record) return false;
     if (record.ttl < Math.floor(Date.now() / 1000)) return false;
+
+    // Best-effort on-chain confirmation
     try {
       const contract = this.getContract();
       return (await contract.isGranted(from, to, scopeHash(scope))) as boolean;
     } catch {
-      return true; // no contract, trust KV
+      return true; // trust KV if no contract
     }
+  }
+
+  /**
+   * Read the full grant record from the granter's KV stream.
+   * Used by recallFromGrant to get granterAgentId for KV index lookups.
+   */
+  async getGrantRecord(
+    from: string,
+    to: string,
+    scope: string
+  ): Promise<{ grantId: string; ttl: number; granterAgentId: string } | null> {
+    const grantorKv = new KvViews(this.storage, from);
+    return grantorKv.getGrant(from, to, scope);
   }
 }

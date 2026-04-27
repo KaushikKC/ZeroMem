@@ -20,22 +20,17 @@ export class VectorIndex {
     private agentId: string
   ) {}
 
-  /** Insert a new vector entry into the appropriate KV shard */
+  /**
+   * Insert a vector entry.
+   * Shard is derived from the persisted item count so restarts always
+   * land in the correct bucket even after a KV wipe + restore.
+   */
   async insert(entry: VectorEntry): Promise<void> {
-    const count = await this.kv.getShardCount(this.agentId, entry.namespace);
-    let shard = Math.floor(count / MAX_PER_SHARD);
-
-    const existing = await this.kv.getShard<VectorEntry>(
-      this.agentId,
-      entry.namespace,
-      shard
-    );
-
-    if (existing.length >= MAX_PER_SHARD) {
-      shard += 1;
-    }
+    const count = await this.kv.getItemCount(this.agentId, entry.namespace);
+    const shard = Math.floor(count / MAX_PER_SHARD);
 
     await this.kv.appendToShard(this.agentId, entry.namespace, shard, [entry]);
+    await this.kv.incrementItemCount(this.agentId, entry.namespace);
   }
 
   /** Find top-k entries by cosine similarity across all shards */
@@ -51,8 +46,9 @@ export class VectorIndex {
     const ns = opts.namespace ?? 'default';
     const tombstoned = opts.tombstonedIds ?? new Set<string>();
 
-    const shardCount = await this.kv.getShardCount(this.agentId, ns);
-    const totalShards = Math.max(1, Math.ceil(shardCount / MAX_PER_SHARD) + 1);
+    const itemCount = await this.kv.getItemCount(this.agentId, ns);
+    // Always scan at least shard 0; add +1 so a partially-filled last shard is included
+    const totalShards = Math.max(1, Math.ceil(itemCount / MAX_PER_SHARD) + 1);
 
     const candidates: Array<VectorEntry & { score: number }> = [];
 
@@ -77,10 +73,10 @@ export class VectorIndex {
       }));
   }
 
-  /** Delete a specific entry by commitId (soft-delete via rebuild) */
+  /** Delete a specific entry by commitId (rebuilds affected shard) */
   async remove(namespace: string, commitId: string): Promise<void> {
-    const shardCount = await this.kv.getShardCount(this.agentId, namespace);
-    const totalShards = Math.max(1, Math.ceil(shardCount / MAX_PER_SHARD) + 1);
+    const itemCount = await this.kv.getItemCount(this.agentId, namespace);
+    const totalShards = Math.max(1, Math.ceil(itemCount / MAX_PER_SHARD) + 1);
 
     for (let s = 0; s < totalShards; s++) {
       const entries = await this.kv.getShard<VectorEntry>(
@@ -95,10 +91,10 @@ export class VectorIndex {
     }
   }
 
-  /** Merge entries from another namespace/branch into this one */
+  /** Merge all entries from srcNamespace into dstNamespace */
   async merge(srcNamespace: string, dstNamespace: string): Promise<void> {
-    const shardCount = await this.kv.getShardCount(this.agentId, srcNamespace);
-    const totalShards = Math.max(1, Math.ceil(shardCount / MAX_PER_SHARD) + 1);
+    const itemCount = await this.kv.getItemCount(this.agentId, srcNamespace);
+    const totalShards = Math.max(1, Math.ceil(itemCount / MAX_PER_SHARD) + 1);
 
     for (let s = 0; s < totalShards; s++) {
       const entries = await this.kv.getShard<VectorEntry>(

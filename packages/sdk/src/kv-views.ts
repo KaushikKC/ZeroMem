@@ -35,13 +35,26 @@ export class KvViews {
     return `idx/${agentId}/${ns}/v/${shard}`;
   }
 
-  async getShardCount(agentId: string, ns: string): Promise<number> {
-    const val = await this.storage.kvGet(
-      this.streamId,
-      `idx/${agentId}/${ns}/shards`
-    );
+  itemCountKey(agentId: string, ns: string): string {
+    return `idx/${agentId}/${ns}/count`;
+  }
+
+  /** Returns total inserted item count (used to derive shard index) */
+  async getItemCount(agentId: string, ns: string): Promise<number> {
+    const val = await this.storage.kvGet(this.streamId, this.itemCountKey(agentId, ns));
     if (!val) return 0;
     return parseInt(new TextDecoder().decode(val), 10);
+  }
+
+  /** Atomically increments the per-namespace item counter */
+  async incrementItemCount(agentId: string, ns: string): Promise<void> {
+    const current = await this.getItemCount(agentId, ns);
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.itemCountKey(agentId, ns),
+        value: new TextEncoder().encode(String(current + 1)),
+      },
+    ]);
   }
 
   async getShard<T>(agentId: string, ns: string, shard: number): Promise<T[]> {
@@ -95,12 +108,15 @@ export class KvViews {
     to: string,
     scope: string,
     grantId: string,
-    ttl: number
+    ttl: number,
+    granterAgentId: string
   ): Promise<void> {
     await this.storage.kvSet(this.streamId, [
       {
         key: this.grantKey(from, to, scope),
-        value: new TextEncoder().encode(JSON.stringify({ grantId, ttl })),
+        value: new TextEncoder().encode(
+          JSON.stringify({ grantId, ttl, granterAgentId })
+        ),
       },
     ]);
   }
@@ -109,13 +125,15 @@ export class KvViews {
     from: string,
     to: string,
     scope: string
-  ): Promise<{ grantId: string; ttl: number } | null> {
+  ): Promise<{ grantId: string; ttl: number; granterAgentId: string } | null> {
     const val = await this.storage.kvGet(
       this.streamId,
       this.grantKey(from, to, scope)
     );
     if (!val) return null;
-    return JSON.parse(new TextDecoder().decode(val));
+    const parsed = JSON.parse(new TextDecoder().decode(val));
+    if (parsed === null) return null;
+    return parsed;
   }
 
   async removeGrant(from: string, to: string, scope: string): Promise<void> {
@@ -133,6 +151,10 @@ export class KvViews {
     return `skill/${agentId}/${name}`;
   }
 
+  skillManifestKey(agentId: string): string {
+    return `skill/${agentId}/__manifest__`;
+  }
+
   async setSkill(agentId: string, name: string, blobRoot: string): Promise<void> {
     await this.storage.kvSet(this.streamId, [
       {
@@ -146,6 +168,24 @@ export class KvViews {
     const val = await this.storage.kvGet(this.streamId, this.skillKey(agentId, name));
     if (!val) return null;
     return new TextDecoder().decode(val);
+  }
+
+  async getSkillManifest(agentId: string): Promise<string[]> {
+    const val = await this.storage.kvGet(
+      this.streamId,
+      this.skillManifestKey(agentId)
+    );
+    if (!val) return [];
+    return JSON.parse(new TextDecoder().decode(val)) as string[];
+  }
+
+  async setSkillManifest(agentId: string, names: string[]): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.skillManifestKey(agentId),
+        value: new TextEncoder().encode(JSON.stringify(names)),
+      },
+    ]);
   }
 
   // ── Tombstones (forget) ────────────────────────────────────────────────────
@@ -190,5 +230,39 @@ export class KvViews {
         },
       ]);
     }
+  }
+
+  // ── Root commit (survives KV wipe) ─────────────────────────────────────────
+
+  rootCommitKey(agentId: string, branch: string): string {
+    return `root/${agentId}/${branch}`;
+  }
+
+  /** Written once on first commit — used by restore() after a KV wipe */
+  async setRootCommitIfAbsent(
+    agentId: string,
+    branch: string,
+    commitId: string
+  ): Promise<void> {
+    const existing = await this.storage.kvGet(
+      this.streamId,
+      this.rootCommitKey(agentId, branch)
+    );
+    if (existing) return; // never overwrite
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.rootCommitKey(agentId, branch),
+        value: new TextEncoder().encode(commitId),
+      },
+    ]);
+  }
+
+  async getRootCommit(agentId: string, branch: string): Promise<string | null> {
+    const val = await this.storage.kvGet(
+      this.streamId,
+      this.rootCommitKey(agentId, branch)
+    );
+    if (!val) return null;
+    return new TextDecoder().decode(val);
   }
 }

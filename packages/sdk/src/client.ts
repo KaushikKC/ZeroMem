@@ -153,8 +153,9 @@ export class ZeroMem {
     // 4. Store commit on 0G (encrypted to self)
     const commitId = await storeCommit(commit, this.storage);
 
-    // 5. Update KV: head pointer + vector index
+    // 5. Update KV: head pointer, root anchor (first commit only), vector index
     await this.kv.setHead(this.agentId, this.currentBranch, commitId);
+    await this.kv.setRootCommitIfAbsent(this.agentId, this.currentBranch, commitId);
     await this.vector.insert({
       commitId,
       text,
@@ -189,15 +190,20 @@ export class ZeroMem {
     ns: string,
     k: number
   ): Promise<RecallResult[]> {
-    const granted = await this.grants.isGranted(from, this.wallet.address, ns);
-    if (!granted) throw new Error(`No valid grant from ${from} for scope ${ns}`);
+    // Read grant record from the GRANTER'S KV stream (not this agent's)
+    const record = await this.grants.getGrantRecord(from, this.wallet.address, ns);
+    if (!record) throw new Error(`No grant found from ${from} for scope '${ns}'`);
+    if (record.ttl < Math.floor(Date.now() / 1000)) {
+      throw new Error(`Grant from ${from} for scope '${ns}' has expired`);
+    }
 
-    const grantRecord = await this.kv.getGrant(from, this.wallet.address, ns);
-    if (!grantRecord) throw new Error('Grant record not found in KV');
+    // granterAgentId is the string agentId used as KV key prefix (e.g. 'researcher-v1')
+    const granterAgentId = record.granterAgentId;
 
-    // Use a temporary vector index pointed at the granter's namespace
+    // KV vector index is publicly readable — create a view on the granter's stream
     const grantorKv = new KvViews(this.storage, from);
-    const grantorVector = new VectorIndex(grantorKv, from);
+    const grantorVector = new VectorIndex(grantorKv, granterAgentId);
+
     const queryEmbedding = await this.inference.embed(query);
     return grantorVector.search(queryEmbedding, { k, namespace: ns });
   }
@@ -415,7 +421,7 @@ export class ZeroMem {
 
   // ── Grant / revoke ─────────────────────────────────────────────────────────
 
-  async grant(opts: { to: string; toPubKey?: string; scope: string; ttl: string }): Promise<string> {
+  async grant(opts: { to: string; toPubKey?: string; scope: string; ttl: string; }): Promise<string> {
     const head = await this.kv.getHead(this.agentId, this.currentBranch);
     if (!head) throw new Error('Nothing to grant — no commits yet');
 
@@ -423,6 +429,7 @@ export class ZeroMem {
 
     const grantId = await this.grants.createGrant({
       from: this.wallet.address,
+      granterAgentId: this.agentId,
       to: opts.to,
       toPubKey,
       scope: opts.scope,
@@ -457,8 +464,8 @@ export class ZeroMem {
     return grantId;
   }
 
-  async revoke(grantId: string): Promise<void> {
-    await this.grants.revoke(grantId);
+  async revoke(grantId: string, opts: { scope?: string; to?: string } = {}): Promise<void> {
+    await this.grants.revoke(grantId, opts.scope ?? 'default', opts.to ?? '');
   }
 
   // ── Forget ─────────────────────────────────────────────────────────────────

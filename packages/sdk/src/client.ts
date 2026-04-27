@@ -96,13 +96,19 @@ export class ZeroMem {
     );
   }
 
-  /** Create a ZeroMem instance, registering the agent if a contract is configured */
-  static async create(config: ZeroMemConfig): Promise<ZeroMem> {
+  /**
+   * Create a ZeroMem instance.
+   * Accepts an optional `_storage` override for testing/relayer use.
+   */
+  static async create(
+    config: ZeroMemConfig & { _storage?: StorageClient }
+  ): Promise<ZeroMem> {
     const instance = new ZeroMem(config);
     await instance.kv.addBranch(instance.agentId, instance.currentBranch);
-    // Best-effort agent registration on-chain
+    // Best-effort on-chain setup (no-op if no contract configured)
     try {
       await instance.grants.registerAgent(instance.storage.pubKey);
+      await instance.grants.initEventListeners();
     } catch {
       // ok — no contract deployed yet
     }
@@ -120,6 +126,8 @@ export class ZeroMem {
 
     const ns = opts.ns ?? 'default';
     const tags = opts.tags ?? [];
+    // Qualify the vector index namespace with the branch so branches are isolated
+    const indexNs = `${this.currentBranch}/${ns}`;
 
     // 1. Generate embedding
     const embedding = await this.inference.embed(text);
@@ -162,7 +170,7 @@ export class ZeroMem {
       embedding,
       ts: Date.now(),
       tags,
-      namespace: ns,
+      namespace: indexNs,
     });
 
     return commitId;
@@ -175,13 +183,13 @@ export class ZeroMem {
     const k = opts.k ?? 5;
     const ns = opts.ns ?? 'default';
 
-    // If recalling from a grant, resolve via the granter's KV namespace
     if (opts.from) {
       return this.recallFromGrant(query, opts.from, ns, k);
     }
 
+    const indexNs = `${this.currentBranch}/${ns}`;
     const queryEmbedding = await this.inference.embed(query);
-    return this.vector.search(queryEmbedding, { k, namespace: ns });
+    return this.vector.search(queryEmbedding, { k, namespace: indexNs });
   }
 
   private async recallFromGrant(
@@ -190,7 +198,6 @@ export class ZeroMem {
     ns: string,
     k: number
   ): Promise<RecallResult[]> {
-    // Read grant record from the GRANTER'S KV stream (not this agent's)
     const record = await this.grants.getGrantRecord(from, this.wallet.address, ns);
     if (!record) throw new Error(`No grant found from ${from} for scope '${ns}'`);
     if (record.ttl < Math.floor(Date.now() / 1000)) {
@@ -204,8 +211,10 @@ export class ZeroMem {
     const grantorKv = new KvViews(this.storage, from);
     const grantorVector = new VectorIndex(grantorKv, granterAgentId);
 
+    // Use branch-qualified namespace: granter likely stored on their 'main' branch
+    const indexNs = `main/${ns}`;
     const queryEmbedding = await this.inference.embed(query);
-    return grantorVector.search(queryEmbedding, { k, namespace: ns });
+    return grantorVector.search(queryEmbedding, { k, namespace: indexNs });
   }
 
   // ── Git operations ─────────────────────────────────────────────────────────
@@ -491,26 +500,54 @@ export class ZeroMem {
     const commit = await signCommit(partial, this.wallet);
     const forgotCommitId = await storeCommit(commit, this.storage);
     await this.kv.setHead(this.agentId, this.currentBranch, forgotCommitId);
-    // Remove from vector index
-    await this.vector.remove('default', commitId);
+    // Remove from vector index — all namespaces on this branch
+    for (const suffix of ['default', 'semantic', 'sessions', 'plans']) {
+      await this.vector.remove(`${this.currentBranch}/${suffix}`, commitId);
+    }
   }
 
   // ── Restore (KV rebuild from Log) ─────────────────────────────────────────
 
-  async restore(branch?: string): Promise<void> {
+  /**
+   * Rebuild all KV views by walking the 0G Log DAG.
+   *
+   * After a KV wipe, provide `opts.tipCommitId` (the rootHash of the most
+   * recent commit). If omitted, falls back to the persisted KV head, then
+   * the root-commit anchor written on the first `remember()`.
+   *
+   * The blob layer (0G Storage) is permanent — only KV needs rebuilding.
+   */
+  async restore(
+    branch?: string,
+    opts: { tipCommitId?: string } = {}
+  ): Promise<void> {
     const b = branch ?? this.currentBranch;
-    const head = await this.kv.getHead(this.agentId, b);
-    if (!head) throw new Error(`No head for branch '${b}'`);
 
-    let newHead: string | null = null;
+    const tip =
+      opts.tipCommitId ??
+      (await this.kv.getHead(this.agentId, b)) ??
+      (await this.kv.getRootCommit(this.agentId, b));
+
+    if (!tip) {
+      throw new Error(
+        `Cannot restore branch '${b}': no tip commit found in KV. ` +
+        `Pass the last known commitId: mem.restore('${b}', { tipCommitId: '0x...' })`
+      );
+    }
+
+    // Walk from tip → root, collecting all commits in reverse-chronological order
     const allCommits: Array<{ commitId: string; commit: ZeroCommit }> = [];
-
-    for await (const entry of walkCommits(head, this.storage, this.privateKey)) {
+    for await (const entry of walkCommits(tip, this.storage, this.privateKey)) {
       allCommits.push(entry);
     }
 
-    // Replay commits in chronological order to rebuild KV
+    // Replay in chronological order (oldest → newest)
+    let latestCommitId: string | null = null;
+    let firstCommitId: string | null = null;
+
     for (const { commitId, commit } of allCommits.reverse()) {
+      if (!firstCommitId) firstCommitId = commitId;
+
       if (commit.op === 'remember') {
         try {
           const data = await this.storage.download(commit.payload_root, {
@@ -528,19 +565,26 @@ export class ZeroMem {
               embedding: payload.embedding,
               ts: commit.metadata.ts,
               tags: payload.tags ?? [],
-              namespace: commit.namespace,
+              // Use branch-qualified namespace to match what remember() writes
+              namespace: `${commit.branch}/${commit.namespace}`,
             });
           }
         } catch {
-          // skip corrupted commits
+          // skip corrupted / unreadable commits
         }
       }
-      newHead = commitId;
+
+      latestCommitId = commitId;
     }
 
-    if (newHead) {
-      await this.kv.setHead(this.agentId, b, newHead);
+    // Rebuild KV administrative keys
+    if (latestCommitId) {
+      await this.kv.setHead(this.agentId, b, latestCommitId);
     }
+    if (firstCommitId) {
+      await this.kv.setRootCommitIfAbsent(this.agentId, b, firstCommitId);
+    }
+    await this.kv.addBranch(this.agentId, b);
   }
 
   // ── Escape hatch ───────────────────────────────────────────────────────────

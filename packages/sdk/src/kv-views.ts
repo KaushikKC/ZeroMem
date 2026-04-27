@@ -145,6 +145,35 @@ export class KvViews {
     ]);
   }
 
+  // ── Grant reverse-index (grantId → {from,to,scope}) ───────────────────────
+
+  grantIndexKey(grantId: string): string {
+    return `grantidx/${grantId}`;
+  }
+
+  async setGrantIndex(
+    grantId: string,
+    meta: { from: string; to: string; scope: string }
+  ): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.grantIndexKey(grantId),
+        value: new TextEncoder().encode(JSON.stringify(meta)),
+      },
+    ]);
+  }
+
+  async getGrantIndex(
+    grantId: string
+  ): Promise<{ from: string; to: string; scope: string } | null> {
+    const val = await this.storage.kvGet(
+      this.streamId,
+      this.grantIndexKey(grantId)
+    );
+    if (!val) return null;
+    return JSON.parse(new TextDecoder().decode(val));
+  }
+
   // ── Skill blobs ────────────────────────────────────────────────────────────
 
   skillKey(agentId: string, name: string): string {

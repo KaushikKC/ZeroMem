@@ -1,7 +1,6 @@
 import { ethers } from 'ethers';
 import { KvViews } from './kv-views.js';
 import type { StorageClient } from './storage.js';
-import type { GrantRecord } from './types.js';
 
 const GRANT_REGISTRY_ABI = [
   'function registerAgent(string calldata pubkey) external',
@@ -34,6 +33,7 @@ function ttlToTimestamp(ttl: string): bigint {
 
 export class GrantManager {
   private contract: ethers.Contract | null = null;
+  private listenerActive = false;
 
   constructor(
     private storage: StorageClient,
@@ -65,15 +65,13 @@ export class GrantManager {
       const tx = await contract.registerAgent(pubkey);
       await tx.wait();
     } catch {
-      // no contract deployed yet — silently skip
+      // no contract deployed yet
     }
   }
 
   /**
    * Grant read access to a memory scope.
-   * - Re-uploads head commit payload encrypted to recipient pubkey
-   * - Writes grant record into granter's KV stream (this.kv = granter's)
-   * - Optionally records on-chain via GrantRegistry
+   * Writes a grant record + reverse-index into the granter's KV stream.
    */
   async createGrant(opts: {
     from: string;
@@ -89,7 +87,7 @@ export class GrantManager {
 
     // Re-encrypt head commit for recipient
     const data = await this.storage.download(headCommitId, { privateKey });
-    const payloadRoot = await this.storage.upload(data, {
+    await this.storage.upload(data, {
       encrypt: true,
       recipientPubKey: toPubKey,
     });
@@ -120,8 +118,11 @@ export class GrantManager {
       );
     }
 
-    // Write to granter's KV stream (this.kv is always the granter's)
+    // Write grant record into granter's KV stream (this.kv = granter's)
     await this.kv.setGrant(from, to, scope, grantId, Number(ttlTimestamp), granterAgentId);
+
+    // Write reverse-index so event listener can look up from/to/scope by grantId
+    await this.kv.setGrantIndex(grantId, { from, to, scope });
 
     return grantId;
   }
@@ -136,22 +137,80 @@ export class GrantManager {
       // no contract
     }
     // Remove from granter's KV stream
-    await this.kv.removeGrant(this.wallet.address, to, scope);
+    if (scope && to) {
+      await this.kv.removeGrant(this.wallet.address, to, scope);
+    } else {
+      // Fall back to reverse-index lookup
+      const meta = await this.kv.getGrantIndex(grantId);
+      if (meta) {
+        await this.kv.removeGrant(meta.from, meta.to, meta.scope);
+      }
+    }
   }
 
   /**
-   * Check if a grant is valid.
-   * Reads from the GRANTER's KV stream (keyed by `from` address).
+   * Start listening for on-chain GrantRevoked events.
+   * On each event: look up the reverse-index and remove the KV grant entry.
+   * Safe to call multiple times — only wires once.
+   */
+  async initEventListeners(): Promise<void> {
+    if (this.listenerActive) return;
+    try {
+      const contract = this.getContract();
+      this.listenerActive = true;
+
+      contract.on('GrantRevoked', async (grantId: string) => {
+        try {
+          // Reverse-lookup: grantId → {from, to, scope}
+          const meta = await this.kv.getGrantIndex(grantId);
+          if (!meta) return;
+
+          // Remove from granter's KV stream
+          await this.kv.removeGrant(meta.from, meta.to, meta.scope);
+        } catch {
+          // log and continue — listener must never crash
+        }
+      });
+
+      contract.on('GrantCreated', async (grantId: string, from: string, to: string) => {
+        // Opportunistically cache the index entry in case we missed createGrant
+        try {
+          const existing = await this.kv.getGrantIndex(grantId);
+          if (!existing) {
+            // We only know from/to from the event; scope is unknown without a separate query
+            // Skip — the index is written by createGrant on the granter side
+          }
+        } catch {
+          // ignore
+        }
+      });
+    } catch {
+      this.listenerActive = false;
+      // contract not available — skip
+    }
+  }
+
+  /** Stop all contract event listeners */
+  stopEventListeners(): void {
+    try {
+      this.contract?.removeAllListeners();
+      this.listenerActive = false;
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Check if a grant is still valid.
+   * Reads from the GRANTER's KV stream (stream ID derived from `from` address).
    */
   async isGranted(from: string, to: string, scope: string): Promise<boolean> {
-    // Read from granter's KV stream, not the local (recipient's) stream
     const grantorKv = new KvViews(this.storage, from);
     const record = await grantorKv.getGrant(from, to, scope);
 
     if (!record) return false;
     if (record.ttl < Math.floor(Date.now() / 1000)) return false;
 
-    // Best-effort on-chain confirmation
     try {
       const contract = this.getContract();
       return (await contract.isGranted(from, to, scopeHash(scope))) as boolean;
@@ -162,7 +221,7 @@ export class GrantManager {
 
   /**
    * Read the full grant record from the granter's KV stream.
-   * Used by recallFromGrant to get granterAgentId for KV index lookups.
+   * `from` must be the granter's EVM wallet address.
    */
   async getGrantRecord(
     from: string,

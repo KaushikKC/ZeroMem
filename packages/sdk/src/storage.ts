@@ -18,6 +18,9 @@ export class StorageClient {
   private signer: ethers.Wallet;
   private rpcUrl: string;
   private flowContract: string;
+  /** Write-through cache: zgs_kv replay lags chain by minutes; cache lets
+   *  same-process reads see writes immediately. Survives restart only via Log replay. */
+  private kvCache = new Map<string, Uint8Array>();
 
   constructor(
     privateKey: string,
@@ -50,25 +53,61 @@ export class StorageClient {
     );
   }
 
+  /** Pick storage nodes whose logSyncHeight is close to chain head, covering both shards */
+  private async healthyNodes(): Promise<any[]> {
+    const sdk: any = await import('@0gfoundation/0g-ts-sdk');
+    const { StorageNode } = sdk;
+    const sharded: any = await this.indexer.getShardedNodes();
+    const trusted: any[] = sharded?.trusted ?? [];
+    const head = await this.signer.provider!.getBlockNumber();
+    const HEALTH_LAG = 200;
+    const checks = await Promise.all(
+      trusted.map(async (n: any) => {
+        const sn = new StorageNode(n.url);
+        try {
+          const st: any = await Promise.race([
+            sn.getStatus(),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
+          ]);
+          const h = Number(st?.logSyncHeight ?? 0);
+          return h >= head - HEALTH_LAG ? { node: n, client: sn } : null;
+        } catch { return null; }
+      })
+    );
+    const healthy = checks.filter((x): x is { node: any; client: any } => x !== null);
+    if (healthy.length === 0) throw new Error(`no healthy storage nodes (chain head=${head})`);
+    const byShard = new Map<number, any>();
+    for (const { node, client } of healthy) {
+      const sid = node.config.shardId;
+      if (!byShard.has(sid)) byShard.set(sid, client);
+    }
+    return Array.from(byShard.values());
+  }
+
   /** Upload arbitrary bytes, optionally ECIES-encrypted to recipient */
   async upload(data: Uint8Array, opts: UploadOpts = {}): Promise<string> {
     const memData = new MemData(data);
 
-    let uploadOpts: Record<string, unknown> | undefined;
-    if (opts.encrypt && opts.recipientPubKey) {
-      uploadOpts = {
-        encryption: { type: 'ecies', recipientPubKey: opts.recipientPubKey },
-      };
-    }
+    const sdk: any = await import('@0gfoundation/0g-ts-sdk');
+    const { Uploader, FixedPriceFlow__factory, mergeUploadOptions } = sdk;
 
-    const [tx, err] = await this.indexer.upload(
-      memData,
-      this.rpcUrl,
-      this.signer,
-      uploadOpts as any
-    );
-    if (err !== null) throw new Error(`0G upload failed: ${err}`);
-    return (tx as any).rootHash as string;
+    const uploadOpts: Record<string, unknown> = {};
+    if (opts.encrypt && opts.recipientPubKey) {
+      uploadOpts.encryption = { type: 'ecies', recipientPubKey: opts.recipientPubKey };
+    }
+    const merged = mergeUploadOptions
+      ? mergeUploadOptions({ ...uploadOpts, finalityRequired: false, skipIfFinalized: true })
+      : { expectedReplica: 1, taskSize: 1, finalityRequired: false, fragmentSize: 4 * 1024 * 1024 * 1024, skipIfFinalized: true, ...uploadOpts };
+
+    const nodes = await this.healthyNodes();
+    const flow = FixedPriceFlow__factory.connect(this.flowContract, this.signer);
+    const uploader = new Uploader(nodes, this.rpcUrl, flow);
+
+    const [result, err] = await uploader.splitableUpload(memData, merged);
+    if (err != null) throw new Error(`0G upload failed: ${err.message ?? err}`);
+    const rootHash = result?.rootHashes?.[0] ?? result?.rootHash;
+    if (!rootHash) throw new Error('0G upload returned no rootHash');
+    return rootHash as string;
   }
 
   /** Download bytes, optionally ECIES-decrypt with private key */
@@ -96,30 +135,37 @@ export class StorageClient {
 
   /** KV read — returns null if key missing */
   async kvGet(streamId: string, key: string): Promise<Uint8Array | null> {
+    const cacheKey = `${streamId}:${key}`;
+    const cached = this.kvCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+
     const keyBytes = Uint8Array.from(Buffer.from(key, 'utf-8'));
     const b64Key = Buffer.from(keyBytes).toString('base64');
-    const value = await this.kvClient.getValue(streamId, b64Key as any);
+    const value: any = await this.kvClient.getValue(streamId, b64Key as any);
     if (value == null) return null;
-    return Buffer.from(value as unknown as string, 'base64');
+    const data = typeof value === 'string' ? value : value.data;
+    if (data == null || data === '') return null;
+    const bytes = Buffer.from(data, 'base64');
+    this.kvCache.set(cacheKey, bytes);
+    return bytes;
   }
 
   /** KV write — on-chain transaction */
   async kvSet(streamId: string, pairs: Array<{ key: string; value: Uint8Array }>): Promise<void> {
-    const [nodes, err] = await this.indexer.selectNodes(1);
-    if (err !== null) throw new Error(`selectNodes failed: ${err}`);
+    const sdk: any = await import('@0gfoundation/0g-ts-sdk');
+    const { Batcher, FixedPriceFlow__factory } = sdk;
 
-    const { Batcher } = await import('@0gfoundation/0g-ts-sdk') as any;
-    // flowContract as ethers.Contract instance so Batcher can sign transactions
-    const flowContractInstance = new ethers.Contract(
+    const nodes = await this.healthyNodes();
+    const flowContractInstance = FixedPriceFlow__factory.connect(
       this.flowContract,
-      [],
-      this.signer
+      this.signer,
     );
     const batcher = new Batcher(1, nodes, flowContractInstance, this.rpcUrl);
 
     for (const { key, value } of pairs) {
       const keyBytes = Uint8Array.from(Buffer.from(key, 'utf-8'));
       batcher.streamDataBuilder.set(streamId, keyBytes, value);
+      this.kvCache.set(`${streamId}:${key}`, value);
     }
 
     const [, batchErr] = await batcher.exec();

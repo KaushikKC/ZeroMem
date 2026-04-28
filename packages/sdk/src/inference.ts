@@ -60,6 +60,9 @@ export class InferenceClient {
     messages: ChatMessage[],
     model = 'qwen-2.5-7b-instruct'
   ): Promise<string> {
+    if (!this.endpoint()) {
+      throw new Error('NO_INFERENCE_ENDPOINT');
+    }
     const headers = await this.getHeaders();
     const resp = await fetch(`${this.endpoint()}/chat/completions`, {
       method: 'POST',
@@ -124,7 +127,8 @@ export class InferenceClient {
   /** Reflect over episodic memories and produce semantic summary */
   async reflect(memories: string[]): Promise<string> {
     const combined = memories.join('\n---\n');
-    return this.chat([
+    try {
+      return await this.chat([
       {
         role: 'system',
         content:
@@ -132,11 +136,19 @@ export class InferenceClient {
       },
       { role: 'user', content: combined },
     ]);
+    } catch (e: any) {
+      if (e?.message === 'NO_INFERENCE_ENDPOINT') {
+        return '(reflector unavailable: ZG_COMPUTE_ENDPOINT not set)';
+      }
+      throw e;
+    }
   }
 
   /** Generate a hierarchical task plan for a goal */
   async plan(goal: string, context: string): Promise<unknown> {
-    const raw = await this.chat([
+    let raw: string;
+    try {
+      raw = await this.chat([
       {
         role: 'system',
         content: `You are a hierarchical task planner. Generate a JSON plan for the given goal using context.
@@ -147,6 +159,12 @@ Return: { "goal": string, "tasks": [{ "id": string, "description": string, "depe
         content: `Goal: ${goal}\n\nContext:\n${context}`,
       },
     ]);
+    } catch (e: any) {
+      if (e?.message === 'NO_INFERENCE_ENDPOINT') {
+        return { goal, tasks: [{ id: 't1', description: '(planner unavailable: ZG_COMPUTE_ENDPOINT not set)', dependsOn: [] }] };
+      }
+      throw e;
+    }
     try {
       const match = raw.match(/\{[\s\S]*\}/);
       return match ? JSON.parse(match[0]) : { goal, tasks: [] };

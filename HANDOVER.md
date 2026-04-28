@@ -63,7 +63,7 @@ When the agent calls `mem.recall("how should I talk to Alice?")`:
 |---|---|
 | `sdk/src/client.ts` | The main `ZeroMem` class. This is the public API — `remember`, `recall`, `branch`, `merge`, `replay`, `reflect`, `plan`, `grant`, `revoke`, `forget`, `restore`, `skills` |
 | `sdk/src/commit.ts` | Defines the `ZeroCommit` struct. Build, sign (secp256k1 via ethers), verify, encode/decode, walk the DAG |
-| `sdk/src/storage.ts` | Thin wrapper over `@0gfoundation/0g-ts-sdk`. Handles ECIES upload/download, KV reads/writes |
+| `sdk/src/storage.ts` | Thin wrapper over `@0gfoundation/0g-ts-sdk`. Handles ECIES upload/download, KV reads/writes. Pre-filters indexer trusted nodes by `logSyncHeight` so Uploader never waits on a stalled storage node. Uses `FixedPriceFlow__factory` to construct the Flow contract with a real ABI (raw `new ethers.Contract(addr, [], signer)` was missing `market()` and crashed Batcher). Uploads default to `finalityRequired: false` + `skipIfFinalized: true` to keep demos under timeout. |
 | `sdk/src/kv-views.ts` | All the KV key patterns. Think of it as the "schema" for the KV layer |
 | `sdk/src/vector.ts` | Cosine similarity search over KV shards. No external vector DB needed |
 | `sdk/src/grant.ts` | Cross-agent memory grants. Writes to on-chain `GrantRegistry`, listens for revoke events |
@@ -72,6 +72,7 @@ When the agent calls `mem.recall("how should I talk to Alice?")`:
 | `sdk/src/git.ts` | Branch, fork, merge, replay, blame. Lower-level helpers called by `client.ts` |
 | `contracts/GrantRegistry.sol` | Solidity contract. Tracks agent pubkeys and grants on 0G EVM |
 | `openclaw-plugin/src/index.ts` | Drop-in wrapper for Vercel AI SDK models |
+| `openclaw-zeromem/` | OpenClaw **gateway** plugin (the one judges expect for the framework track). Hooks: `before_prompt_build` (auto-recall with HTML-escape + injection guard + `<zeromem-memories>` tag wrap) and `agent_end` (auto-capture with tag-stripping + `shouldCapture` filter). Tools: `memory_search`, `memory_store`. CLI: `zeromem search`, `zeromem stats`. Manifest: `openclaw.plugin.json`. 34/34 unit tests. |
 | `examples/research-agent/src/index.ts` | The flagship demo. Run this to see everything work end-to-end |
 
 ---
@@ -80,10 +81,12 @@ When the agent calls `mem.recall("how should I talk to Alice?")`:
 
 ```bash
 cd packages/sdk
-npm test
+npm test                            # 59/59 SDK tests
+cd ../openclaw-zeromem
+npm test                            # 34/34 gateway plugin tests
 ```
 
-59 tests, all in-memory, run in ~10 seconds. This is the fastest way to verify nothing is broken.
+93 total tests, all in-memory, run in ~15 seconds. Fastest way to verify nothing is broken.
 
 The tests use a `MockStorageClient` that replaces the real 0G network calls. It stores blobs and KV data in JavaScript Maps. The inference is mocked to return deterministic word-hash embeddings.
 
@@ -178,7 +181,13 @@ GRANT_REGISTRY_ADDRESS=0x...
 
 ## Things to watch out for
 
-**0G KV endpoint might change.** The default `http://3.101.147.150:6789` is from the testnet docs. If KV reads return nothing, check the 0G Discord for the current testnet KV node address and update `ZG_KV_URL`.
+**0G KV endpoint must be self-hosted.** The hardcoded `http://3.101.147.150:6789` from the testnet docs is unreachable. Run `zgs_kv` locally (binary at `https://github.com/0gfoundation/0g-storage-kv/releases/download/v1.5.1/zgs_kv_linux.zip`) with `stream_ids = [keccak256("zeromem:" + lowercase(walletAddress))]`, set `ZG_KV_URL=http://localhost:6789`. First sync from genesis takes minutes — bump `log_sync_start_block_number` in `config_testnet_turbo.toml` to a recent block to skip ancient history.
+
+**Indexer's selectNodes ignores sync state.** The default 'min'/'max' methods just sort by shardId/numShard. Trusted nodes can be tens of thousands of blocks behind chain head, in which case `Uploader.waitForLogEntry` polls forever. Storage layer pre-filters by `logSyncHeight >= chainHead - 200` before passing nodes to `Uploader`/`Batcher`.
+
+**Flow contract ABI mismatch.** `@0gfoundation/0g-ts-sdk@1.2.6` calls `flow.market()` inside `submitLogEntryNoReceipt`. Constructing the Flow contract with empty ABI (`new ethers.Contract(addr, [], signer)`) silently breaks. Use the SDK's exported `FixedPriceFlow__factory.connect(addr, signer)` instead.
+
+**0G Compute endpoint not yet wired.** With `ZG_COMPUTE_ENDPOINT` empty, `inference.ts` throws `NO_INFERENCE_ENDPOINT` from `chat()`. `reflect()` and `plan()` catch it and return placeholders so the demo doesn't crash. Embeddings still fall back to `@xenova/transformers` (or pseudo-hash if WASM unavailable).
 
 **Batcher API.** The `Batcher` constructor in `storage.ts` takes `(1, nodes, flowContractInstance, rpcUrl)`. If you update `@0gfoundation/0g-ts-sdk`, the constructor signature might change. Check the release notes.
 
@@ -187,6 +196,10 @@ GRANT_REGISTRY_ADDRESS=0x...
 **`skills.run()` uses `new Function()`** — this is fine for a hackathon but is a security risk in production. Replace with a WASM worker.
 
 **Embeddings.** Without a 0G Compute endpoint, the SDK falls back to `@xenova/transformers` (WASM, ~20MB download on first run) and then to a deterministic hash-based pseudo-embedding. The pseudo-embedding makes `recall()` work for exact queries but semantic similarity is random. The tests use the hash-based embed — they pass but don't test real semantic search quality.
+
+**research-agent demo loads `.env` from cwd.** The repo-root `.env` is not picked up by the example. Copy or symlink: `cp .env examples/research-agent/.env`. Same for `examples/visual-demo`.
+
+**Demo run on Galileo (2026-04-28).** GrantRegistry deployed at `0xAa14A95b037b76B0D9CDfD5b34492138273057ec`. Wallet `0xdF572AFB46830bb6fd902c8F40e0F722930AdfCe`. Each `remember()` does ~3-4 on-chain ops (Log blob upload + commit blob upload + KV writes); on Galileo testnet ~10-30s per op. Full 16-step demo lands at ~10-20 min wall-clock with patches applied.
 
 ---
 

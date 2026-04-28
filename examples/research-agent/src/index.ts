@@ -199,6 +199,52 @@ async function main() {
   });
   console.log(`    Skill output: ${JSON.stringify(result)}\n`);
 
+  // ── Step 15: OpenClaw gateway plugin ─────────────────────────────────────
+  console.log('16. Wiring ZeroMem as an OpenClaw gateway plugin...');
+  const { createZeroMemPlugin } = await import('@zeromem/openclaw-gateway');
+  const plugin = await createZeroMemPlugin({
+    privateKey: RESEARCHER_KEY,
+    agentId: 'researcher-v1',
+    grantRegistryAddress: process.env.GRANT_REGISTRY_ADDRESS,
+    rpc: process.env.ZG_RPC,
+    indexer: process.env.ZG_INDEXER,
+    kvUrl: process.env.ZG_KV_URL,
+  });
+
+  const recallCtx = await plugin.hooks.before_prompt_build({
+    sessionKey: 'agent:researcher:demo-session',
+    prompt: 'How does 0G storage work and why is it useful for agent memory?',
+  });
+  console.log('    auto-recall prependContext:');
+  console.log(
+    (recallCtx.prependContext ?? '(no memories surfaced)')
+      .split('\n')
+      .map((l) => '      ' + l)
+      .join('\n'),
+  );
+  console.log(`    namespace instruction: ${recallCtx.appendSystemContext}\n`);
+
+  await plugin.hooks.agent_end({
+    sessionKey: 'agent:researcher:demo-session',
+    messages: [
+      {
+        role: 'user',
+        content: 'I prefer terse responses and TypeScript for backend work always.',
+      },
+      {
+        role: 'assistant',
+        content: 'Noted. I will keep responses terse and prefer TypeScript examples.',
+      },
+    ],
+  });
+  console.log('    auto-capture fired (best-effort).');
+
+  const searchTool = plugin.tools.find((t) => t.name === 'memory_search')!;
+  const toolOut = await searchTool.execute({ query: 'sealed inference', limit: 3 });
+  console.log('    memory_search tool output:');
+  console.log(toolOut.split('\n').map((l) => '      ' + l).join('\n'));
+  console.log();
+
   console.log('=== Demo complete ===');
   console.log('\nAll memory stored on 0G testnet, fully encrypted with ECIES.');
   console.log('Grant Registry contract governs cross-agent access.');

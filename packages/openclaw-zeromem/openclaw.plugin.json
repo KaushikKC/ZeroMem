@@ -1,0 +1,14 @@
+{
+  "name": "zeromem",
+  "version": "0.1.0",
+  "description": "ZeroMem — Git-for-agent-memory on 0G. Auto-recall + auto-capture + memory tools.",
+  "entry": "dist/index.js",
+  "factory": "createZeroMemPlugin",
+  "configKey": "zeromem",
+  "hooks": ["before_prompt_build", "agent_end"],
+  "tools": ["memory_search", "memory_store"],
+  "cli": {
+    "command": "zeromem",
+    "subcommands": ["search", "stats"]
+  }
+}

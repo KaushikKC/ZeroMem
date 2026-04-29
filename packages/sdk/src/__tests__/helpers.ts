@@ -10,6 +10,8 @@ export class MockStorageClient {
   readonly address = '0x742d35Cc6634C0532925a3b8D4C9b5d6b9f7abcd';
   readonly pubKey =
     '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
+  readonly decryptKey =
+    '0x148792b2967a9a3be608b2f4f0cbbcdfbf7417aa6d7d5304911b171648ebc8ad';
 
   async upload(data: Uint8Array, _opts?: unknown): Promise<string> {
     const rootHash = `0x${'0'.repeat(63)}${(++this.blobCounter).toString(16)}`;

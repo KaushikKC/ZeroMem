@@ -57,6 +57,16 @@ export class KvViews {
     ]);
   }
 
+  /** Explicitly set the item count (used by gc after purging tombstoned entries) */
+  async setItemCount(agentId: string, ns: string, count: number): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      {
+        key: this.itemCountKey(agentId, ns),
+        value: new TextEncoder().encode(String(count)),
+      },
+    ]);
+  }
+
   async getShard<T>(agentId: string, ns: string, shard: number): Promise<T[]> {
     const val = await this.storage.kvGet(
       this.streamId,
@@ -293,5 +303,96 @@ export class KvViews {
     );
     if (!val) return null;
     return new TextDecoder().decode(val);
+  }
+
+  // ── Memory Capsule root storage ───────────────────────────────────────────
+
+  capsuleKey(grantId: string): string {
+    return `capsule/${grantId}`;
+  }
+
+  async setCapsuleRoot(grantId: string, capsuleRoot: string): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      { key: this.capsuleKey(grantId), value: this.enc(capsuleRoot) },
+    ]);
+  }
+
+  async getCapsuleRoot(grantId: string): Promise<string | null> {
+    const val = await this.storage.kvGet(this.streamId, this.capsuleKey(grantId));
+    return val ? this.dec(val) : null;
+  }
+
+  // ── Batch write helper ─────────────────────────────────────────────────────
+
+  /**
+   * Write multiple KV pairs in one on-chain transaction.
+   * Use this to batch head + shard + count updates in a single gas payment.
+   */
+  async batch(pairs: Array<{ key: string; value: Uint8Array }>): Promise<void> {
+    if (pairs.length === 0) return;
+    await this.storage.kvSet(this.streamId, pairs);
+  }
+
+  enc(v: string): Uint8Array { return new TextEncoder().encode(v); }
+  dec(v: Uint8Array): string { return new TextDecoder().decode(v); }
+
+  // ── Tombstone list (for gc()) ──────────────────────────────────────────────
+
+  tombListKey(agentId: string): string {
+    return `tomb-list/${agentId}`;
+  }
+
+  async getTombList(agentId: string): Promise<string[]> {
+    const val = await this.storage.kvGet(this.streamId, this.tombListKey(agentId));
+    if (!val) return [];
+    return JSON.parse(this.dec(val)) as string[];
+  }
+
+  async addToTombList(agentId: string, commitId: string): Promise<void> {
+    const list = await this.getTombList(agentId);
+    if (!list.includes(commitId)) {
+      list.push(commitId);
+      await this.storage.kvSet(this.streamId, [
+        { key: this.tombListKey(agentId), value: this.enc(JSON.stringify(list)) },
+      ]);
+    }
+  }
+
+  // ── Snapshot / named checkpoints ──────────────────────────────────────────
+
+  snapshotKey(agentId: string, name: string): string {
+    return `snap/${agentId}/${name}`;
+  }
+
+  async setSnapshot(agentId: string, name: string, commitId: string): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      { key: this.snapshotKey(agentId, name), value: this.enc(commitId) },
+    ]);
+  }
+
+  async getSnapshot(agentId: string, name: string): Promise<string | null> {
+    const val = await this.storage.kvGet(this.streamId, this.snapshotKey(agentId, name));
+    return val ? this.dec(val) : null;
+  }
+
+  // ── Last-reflect timestamp (incremental reflection) ────────────────────────
+
+  lastReflectKey(agentId: string, branch: string): string {
+    return `last-reflect/${agentId}/${branch}`;
+  }
+
+  async getLastReflectTs(agentId: string, branch: string): Promise<number> {
+    const val = await this.storage.kvGet(
+      this.streamId,
+      this.lastReflectKey(agentId, branch)
+    );
+    if (!val) return 0;
+    return parseInt(this.dec(val), 10);
+  }
+
+  async setLastReflectTs(agentId: string, branch: string, ts: number): Promise<void> {
+    await this.storage.kvSet(this.streamId, [
+      { key: this.lastReflectKey(agentId, branch), value: this.enc(String(ts)) },
+    ]);
   }
 }

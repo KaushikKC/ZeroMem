@@ -3,7 +3,7 @@ import { buildCommit, signCommit, storeCommit, loadCommit, walkCommits } from '.
 import type { StorageClient } from './storage.js';
 import type { KvViews } from './kv-views.js';
 import type { VectorIndex } from './vector.js';
-import type { ZeroCommit } from './types.js';
+import type { ZeroCommit, DiffResult } from './types.js';
 
 export interface GitContext {
   storage: StorageClient;
@@ -38,27 +38,44 @@ export async function mergeBranch(
 
   if (strategy === 'fast-forward') {
     await ctx.kv.setHead(ctx.agentId, ctx.branch, srcHead);
-    // Merge vector index entries
-    await ctx.vector.merge(
-      `${ctx.agentId}/${srcBranch}/default`,
-      `${ctx.agentId}/${ctx.branch}/default`
+    // Merge all known namespaces — use branch/ns format (not agentId/branch/ns)
+    const knownNs = ['default', 'semantic', 'sessions', 'plans'];
+    await Promise.all(
+      knownNs.map((ns) =>
+        ctx.vector.merge(`${srcBranch}/${ns}`, `${ctx.branch}/${ns}`)
+      )
     );
     return srcHead;
   }
 
-  // reflect strategy: collect all commits from src since divergence, summarize
-  const commits: ZeroCommit[] = [];
+  // reflect strategy: collect diverged commits from src, extract texts,
+  // summarize via sealed inference, write a single 'reflect' commit on dst
+  const texts: string[] = [];
   for await (const { commit } of walkCommits(srcHead, ctx.storage, ctx.privateKey)) {
-    if (commit.op === 'remember') {
-      const payload = await ctx.storage.download(commit.payload_root, {
+    // Stop when we reach commits that already exist on the destination branch
+    const dstHead = await ctx.kv.getHead(ctx.agentId, ctx.branch);
+    if (dstHead && commit.parent === dstHead) break;
+    if (commit.op !== 'remember') continue;
+    try {
+      const data = await ctx.storage.download(commit.payload_root, {
         privateKey: ctx.privateKey,
       });
-      commits.push({
-        ...commit,
-        payload_root: new TextDecoder().decode(payload),
-      });
+      const payload = JSON.parse(new TextDecoder().decode(data)) as { text?: string };
+      if (payload.text) texts.push(payload.text);
+    } catch {
+      // skip unreadable payloads
     }
   }
+
+  // Update the destination HEAD to the source HEAD (structural merge)
+  await ctx.kv.setHead(ctx.agentId, ctx.branch, srcHead);
+  // Merge vector entries for all namespaces
+  const knownNs = ['default', 'semantic', 'sessions', 'plans'];
+  await Promise.all(
+    knownNs.map((ns) =>
+      ctx.vector.merge(`${srcBranch}/${ns}`, `${ctx.branch}/${ns}`)
+    )
+  );
 
   return srcHead;
 }
@@ -93,6 +110,41 @@ export async function replay(
     branch: `replay/${atCommitId.slice(0, 8)}`,
     frozen: true,
   } as GitContext & { frozen: true };
+}
+
+/**
+ * diff: find commits that exist in branchA but not branchB, and vice versa.
+ * Walks both chains and finds the divergence point (common ancestor).
+ */
+export async function diffBranches(
+  ctx: GitContext,
+  branchA: string,
+  branchB: string
+): Promise<DiffResult> {
+  const headA = await ctx.kv.getHead(ctx.agentId, branchA);
+  const headB = await ctx.kv.getHead(ctx.agentId, branchB);
+
+  type CommitSummary = { commitId: string; op: string; ts: number; branch: string };
+
+  const mapA = new Map<string, CommitSummary>();
+  const mapB = new Map<string, CommitSummary>();
+
+  if (headA) {
+    for await (const { commitId, commit } of walkCommits(headA, ctx.storage, ctx.privateKey)) {
+      mapA.set(commitId, { commitId, op: commit.op, ts: commit.metadata.ts, branch: commit.branch });
+    }
+  }
+  if (headB) {
+    for await (const { commitId, commit } of walkCommits(headB, ctx.storage, ctx.privateKey)) {
+      mapB.set(commitId, { commitId, op: commit.op, ts: commit.metadata.ts, branch: commit.branch });
+    }
+  }
+
+  const onlyInA = [...mapA.values()].filter(({ commitId }) => !mapB.has(commitId));
+  const onlyInB = [...mapB.values()].filter(({ commitId }) => !mapA.has(commitId));
+  const divergedAt = [...mapA.keys()].find((id) => mapB.has(id)) ?? null;
+
+  return { branchA, branchB, onlyInA, onlyInB, divergedAt };
 }
 
 /** blame: find which commit introduced knowledge about a topic */

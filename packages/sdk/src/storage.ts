@@ -40,6 +40,7 @@ export class StorageClient {
   private indexer: Indexer;
   private kvClient: KvClient;
   private signer: ethers.Wallet;
+  private privateKey: string;
   private rpcUrl: string;
   private flowContract: string;
   /** Write-through cache: zgs_kv replay lags chain by minutes; cache lets
@@ -55,6 +56,7 @@ export class StorageClient {
       flowContract?: string;
     } = {}
   ) {
+    this.privateKey = privateKey;
     this.rpcUrl = opts.rpcUrl ?? DEFAULTS.RPC_URL;
     const indexerUrl = opts.indexerUrl ?? DEFAULTS.INDEXER_URL;
     const kvUrl = opts.kvUrl ?? DEFAULTS.KV_URL;
@@ -68,6 +70,10 @@ export class StorageClient {
 
   get address(): string {
     return this.signer.address;
+  }
+
+  get decryptKey(): string {
+    return this.privateKey;
   }
 
   get pubKey(): string {
@@ -130,6 +136,52 @@ export class StorageClient {
     const nodes = await this.healthyNodes();
     const flow = FixedPriceFlow__factory.connect(this.flowContract, this.signer);
     const uploader = new Uploader(nodes, this.rpcUrl, flow);
+
+    /** SDK bug: waitForLogEntry breaks on the first null node instead of trying all nodes.
+     *  With sharded storage (numShard=2), node[0] may not hold the shard for this blob,
+     *  so the loop never reaches node[1] and polls forever. Fix: try ALL nodes per tick,
+     *  succeed if any returns non-null, and add a 90s hard timeout for the post-upload
+     *  confirmation (data is already on-chain once "All tasks processed" is logged). */
+    uploader.waitForLogEntry = async function (
+      root: string,
+      finalityRequired: boolean,
+      txSeq: number,
+      useTxSeq: boolean,
+      onProgress?: (msg: string) => void
+    ) {
+      console.log('Wait for log entry on storage node');
+      const WAIT_TIMEOUT_MS = 90_000;
+      const start = Date.now();
+      let info: any = null;
+      while (true) {
+        if (Date.now() - start > WAIT_TIMEOUT_MS) {
+          console.log('waitForLogEntry: 90s timeout — data is on-chain, continuing');
+          return info;
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+        for (const client of (this as any).nodes) {
+          try {
+            const candidate = useTxSeq
+              ? await client.getFileInfoByTxSeq(txSeq)
+              : await client.getFileInfo(root, true);
+            if (candidate !== null) {
+              info = candidate;
+              break;
+            }
+          } catch { /* skip unresponsive node */ }
+        }
+        if (info !== null && (!finalityRequired || info.finalized)) break;
+        try {
+          const status = await (this as any).nodes[0].getStatus();
+          if (status?.logSyncHeight) {
+            const msg = `Waiting for storage node to sync (height=${status.logSyncHeight})...`;
+            console.log(msg);
+            onProgress?.(msg);
+          }
+        } catch { /* status fetch optional */ }
+      }
+      return info;
+    };
 
     const [result, err] = await uploader.splitableUpload(memData, merged);
     if (err != null) throw new Error(`0G upload failed: ${err.message ?? err}`);

@@ -57,17 +57,116 @@ When the agent calls `mem.recall("how should I talk to Alice?")`:
 
 ---
 
+## Full on-chain flow: what happens on each `remember()`
+
+This traces one call — `mem.remember("0G uses append-only Log blobs")` — through every layer.
+
+```
+Developer code
+     |
+     v
+ZeroMem SDK  (packages/sdk/src/client.ts)
+     |
+     |-- 1. EMBED
+     |        inference.ts calls 0G Compute /embeddings endpoint
+     |        → 384-dim float vector  [0.12, -0.34, 0.89 ...]
+     |        Fallback chain: 0G Compute → @xenova/transformers WASM → pseudo-hash
+     |
+     |-- 2. BUILD PAYLOAD BLOB
+     |        { text, embedding, tags, ts } — JSON, ~3-4 KB for 384-dim embed
+     |        ECIES-encrypt to agent's own Ethereum wallet pubkey
+     |        → sealed Uint8Array
+     |
+     |-- 3. UPLOAD PAYLOAD BLOB  →  0G Storage Log layer
+     |        MemData(encryptedBytes) builds Merkle tree → rootHash computed
+     |        Uploader.submitLogEntryNoReceipt() → EVM tx on Galileo (chain 16602)
+     |          flow.submit(submission, { value: storageFee })
+     |          fee ≈ 30-1100 Gwei × sectors (scales with blob size)
+     |        Storage nodes download the shard once tx is mined
+     |        Uploader.waitForLogEntry() polls nodes until one confirms it
+     |        returns: payloadRoot = "0xabc..."
+     |
+     |-- 4. BUILD COMMIT OBJECT
+     |        ZeroCommit {
+     |          version: 1,
+     |          parent: prevCommitId | null,
+     |          agent_id: "researcher-v1",
+     |          author_pubkey: "0x03...",
+     |          op: "remember",
+     |          branch: "main",
+     |          namespace: "main/default",
+     |          payload_root: payloadRoot,
+     |          metadata: { ts, embedding_dim: 384, tags }
+     |        }
+     |        sign with secp256k1 via ethers.Wallet.signMessage()
+     |
+     |-- 5. UPLOAD COMMIT BLOB  →  0G Storage Log layer
+     |        Same upload path as step 3
+     |        returns: commitId = "0xdef..."   ← this IS the commit hash
+     |
+     |-- 6. KV WRITES  →  0G Storage KV layer (zgs_kv, self-hosted)
+     |        Write 1 — HEAD pointer
+     |          key:   head/researcher-v1/main
+     |          value: commitId
+     |        Write 2 — vector index shard
+     |          key:   idx/researcher-v1/main/default/v/0
+     |          value: JSON array of VectorEntry objects (append)
+     |        Write 3 (first commit only) — root commit anchor
+     |          key:   root/researcher-v1/main
+     |          value: commitId
+     |        Each write: Batcher encodes as StreamData blob → EVM tx → zgs_kv indexes it
+     |        stream_id = keccak256("zeromem:" + lowercase(walletAddress))
+     |        Write-through in-process cache makes reads visible immediately
+     |        (zgs_kv replay lag is minutes; cache bridges the gap within the same process)
+```
+
+### How `recall()` uses what was stored
+
+```
+mem.recall("how does 0G store data?")
+     |
+     |-- 1. Embed query → vector Q
+     |-- 2. KV GET all shards: idx/researcher-v1/main/default/v/0, v/1, ...
+     |-- 3. Cosine similarity: score = dot(Q, entry.embedding) for each entry
+     |-- 4. Return top-k entries sorted by score
+     |        entry.text decoded and decrypted from payload blob on demand
+```
+
+### Why the demo tests this end-to-end
+
+The 16-step research-agent demo exercises every layer:
+
+| Step | Operation | What it proves |
+|---|---|---|
+| 1-3 | `remember()` × 3 | Blobs land on 0G Log + KV index is queryable |
+| 4 | `branch('hypothesis-...')` | Branch creates isolated KV namespace, no bleed |
+| 5 | `recall('storage')` | Cosine similarity search works over real vectors |
+| 6 | `ask('question')` | Recall + 0G Compute answer over retrieved memory context |
+| 7 | `plan('write paper')` | Planner returns valid DAG task structure |
+| 8-9 | `grant(writerPubKey, 'read')` | GrantRegistry tx + HEAD re-encrypted to recipient |
+| 10 | Writer `recallFromGrant()` | Cross-agent read via grant works |
+| 11 | `revoke(grantId)` | On-chain revocation via GrantRegistry |
+| 12 | `forget(commitId)` | Tombstone written, commit excluded from future recall |
+| 13 | KV wipe → `restore(tipCommitId)` | DAG replayed from Log, vector index rebuilt |
+| 14 | `skills.register()` + `skills.run()` | Signed code blob uploaded and executed |
+| 15 | `merge('hypothesis-...')` | Branch vectors merged into main namespace |
+| 16 | OpenClaw plugin | `before_prompt_build` auto-recall + `agent_end` auto-capture |
+
+Blobs visible at `https://storagescan-galileo.0g.ai` for the demo wallet after the run.
+
+---
+
 ## Key files — what each one does
 
 | File | What it does |
 |---|---|
-| `sdk/src/client.ts` | The main `ZeroMem` class. This is the public API — `remember`, `recall`, `branch`, `merge`, `replay`, `reflect`, `plan`, `grant`, `revoke`, `forget`, `restore`, `skills` |
+| `sdk/src/client.ts` | The main `ZeroMem` class. This is the public API — `remember`, `recall`, `ask`, `branch`, `merge`, `replay`, `plan`, `grant`, `revoke`, `forget`, `restore`, `skills` |
 | `sdk/src/commit.ts` | Defines the `ZeroCommit` struct. Build, sign (secp256k1 via ethers), verify, encode/decode, walk the DAG |
-| `sdk/src/storage.ts` | Thin wrapper over `@0gfoundation/0g-ts-sdk`. Handles ECIES upload/download, KV reads/writes. Pre-filters indexer trusted nodes by `logSyncHeight` so Uploader never waits on a stalled storage node. Uses `FixedPriceFlow__factory` to construct the Flow contract with a real ABI (raw `new ethers.Contract(addr, [], signer)` was missing `market()` and crashed Batcher). Uploads default to `finalityRequired: false` + `skipIfFinalized: true` to keep demos under timeout. |
+| `sdk/src/storage.ts` | Thin wrapper over `@0gfoundation/0g-ts-sdk`. Handles ECIES upload/download, KV reads/writes. Pre-filters indexer trusted nodes by `logSyncHeight` so Uploader never waits on a stalled storage node. Uses `FixedPriceFlow__factory` to construct the Flow contract with a real ABI (raw `new ethers.Contract(addr, [], signer)` was missing `market()` and crashed Batcher). Uploads default to `finalityRequired: false` + `skipIfFinalized: true` to keep demos under timeout. Monkey-patches `uploader.waitForLogEntry` to fix SDK bug: the SDK breaks on the first null node instead of trying all nodes — with numShard=2 the wrong shard's node returns null forever; the patch tries all nodes per tick and adds a 90s hard timeout so the demo isn't stuck after segments are already on-chain. Write-through `kvCache` bridges zgs_kv replay lag within the same process. |
 | `sdk/src/kv-views.ts` | All the KV key patterns. Think of it as the "schema" for the KV layer |
 | `sdk/src/vector.ts` | Cosine similarity search over KV shards. No external vector DB needed |
 | `sdk/src/grant.ts` | Cross-agent memory grants. Writes to on-chain `GrantRegistry`, listens for revoke events |
-| `sdk/src/inference.ts` | Wraps 0G Compute for embeddings + reflection. Falls back to local WASM if no endpoint |
+| `sdk/src/inference.ts` | Wraps 0G Compute for embeddings + ask/planning. Falls back to local WASM if no endpoint |
 | `sdk/src/skills.ts` | Procedural memory — store and run signed code blobs |
 | `sdk/src/git.ts` | Branch, fork, merge, replay, blame. Lower-level helpers called by `client.ts` |
 | `contracts/GrantRegistry.sol` | Solidity contract. Tracks agent pubkeys and grants on 0G EVM |
@@ -122,7 +221,7 @@ The demo prints 14 steps including:
 - Researcher stores 3 facts
 - Creates an experiment branch
 - Recalls semantically similar memories
-- Reflector compacts episodic → semantic
+- Ask endpoint answers a question from recalled memory context
 - Generates a hierarchical plan
 - Grants Writer agent 24h read access
 - Writer recalls from Researcher's memory
@@ -187,9 +286,11 @@ GRANT_REGISTRY_ADDRESS=0x...
 
 **Flow contract ABI mismatch.** `@0gfoundation/0g-ts-sdk@1.2.6` calls `flow.market()` inside `submitLogEntryNoReceipt`. Constructing the Flow contract with empty ABI (`new ethers.Contract(addr, [], signer)`) silently breaks. Use the SDK's exported `FixedPriceFlow__factory.connect(addr, signer)` instead.
 
-**0G Compute endpoint not yet wired.** With `ZG_COMPUTE_ENDPOINT` empty, `inference.ts` throws `NO_INFERENCE_ENDPOINT` from `chat()`. `reflect()` and `plan()` catch it and return placeholders so the demo doesn't crash. Embeddings still fall back to `@xenova/transformers` (or pseudo-hash if WASM unavailable).
+**0G Compute endpoint not yet wired.** With `ZG_COMPUTE_ENDPOINT` empty, `inference.ts` throws `NO_INFERENCE_ENDPOINT` from `chat()`. `ask()`, `reflect()`, and `plan()` catch it and return placeholders so the demo doesn't crash. Embeddings still fall back to `@xenova/transformers` (or pseudo-hash if WASM unavailable).
 
 **Batcher API.** The `Batcher` constructor in `storage.ts` takes `(1, nodes, flowContractInstance, rpcUrl)`. If you update `@0gfoundation/0g-ts-sdk`, the constructor signature might change. Check the release notes.
+
+**KV 256-byte blob limit (P0 bug — vector writes fail).** The 0G Flow contract silently rejects KV-tagged blob submissions that produce >1 SubmissionNode. A blob crosses the 1-node boundary at 256 bytes (1 chunk): `computePaddedSize(N chunks > 1)` returns multiple nodes, and `submit()` reverts with `require(false)` at `estimateGas`. Small KV writes (HEAD pointer, branch list, root anchor) encode to ≤256 bytes and succeed. Vector index shard writes encode a JSON array of VectorEntry objects — each entry contains a 384-dim float embedding (~8 KB as JSON) — and fail. **Fix:** do not store embeddings in KV at all. Upload each VectorEntry as a Log blob (same ECIES encrypt + upload path), store only the 32-byte rootHash per entry in the KV shard. Recall reads the shard (list of rootHashes), downloads each blob, decrypts, then runs cosine similarity. This respects the ≤256-byte KV constraint and mirrors how the commit DAG already works. Files to change: `sdk/src/vector.ts` (insert/search), `sdk/src/kv-views.ts` (shard stores rootHashes, not full entries).
 
 **`recallFromGrant` assumes granter branch is `main`.** If the granter created their memories on a different branch, recall will return empty. This is hardcoded to `main` in `client.ts:recallFromGrant`. Easy to fix by adding a `grantorBranch` option to `grant()`.
 

@@ -2,13 +2,13 @@ import { ethers } from 'ethers';
 import { buildCommit, signCommit, storeCommit, loadCommit, walkCommits } from './commit.js';
 import type { StorageClient } from './storage.js';
 import type { KvViews } from './kv-views.js';
-import type { VectorIndex } from './vector.js';
+import type { MemoryIndex } from './memory-index.js';
 import type { ZeroCommit, DiffResult } from './types.js';
 
 export interface GitContext {
   storage: StorageClient;
   kv: KvViews;
-  vector: VectorIndex;
+  vector: MemoryIndex;
   wallet: ethers.Wallet;
   agentId: string;
   branch: string;

@@ -2,6 +2,8 @@ import { ethers } from 'ethers';
 import { StorageClient } from './storage.js';
 import { KvViews } from './kv-views.js';
 import { VectorIndex } from './vector.js';
+import { PostgresVectorIndex } from './pg-index.js';
+import type { MemoryIndex } from './memory-index.js';
 import { InferenceClient } from './inference.js';
 import { GrantManager } from './grant.js';
 import { SkillsManager } from './skills.js';
@@ -21,7 +23,6 @@ import {
 } from './git.js';
 import {
   deriveKvSymKey,
-  encryptKvText,
   decryptKvText,
   createAccessChallenge,
   respondToChallenge,
@@ -32,6 +33,7 @@ import {
 import type {
   ZeroMemConfig,
   RecallResult,
+  AskResult,
   Plan,
   ZeroCommit,
   SearchOpts,
@@ -62,10 +64,12 @@ export interface RecallOpts {
   from?: string;
 }
 
+export interface AskOpts extends RecallOpts {}
+
 export class ZeroMem {
   private storage: StorageClient;
   private kv: KvViews;
-  private vector: VectorIndex;
+  private vector: MemoryIndex;
   private inference: InferenceClient;
   private grants: GrantManager;
   readonly skills: SkillsManager;
@@ -74,12 +78,14 @@ export class ZeroMem {
   readonly agentId: string;
   readonly currentBranch: string;
   private readonly privateKey: string;
+  private readonly postgresUrl?: string;
   private frozen = false;
   /** Per-wallet AES-256-GCM key for encrypting text in KV shards */
   private readonly kvSymKey: Buffer;
 
-  private constructor(config: ZeroMemConfig & { _storage?: StorageClient; _branch?: string; _frozen?: boolean }) {
+  private constructor(config: ZeroMemConfig & { _storage?: StorageClient; _branch?: string; _frozen?: boolean; _vector?: MemoryIndex }) {
     this.privateKey = config.privateKey;
+    this.postgresUrl = config.postgresUrl;
     this.agentId = config.agentId;
     this.currentBranch = config._branch ?? config.branch ?? 'main';
     this.frozen = config._frozen ?? false;
@@ -97,7 +103,11 @@ export class ZeroMem {
     this.wallet = new ethers.Wallet(config.privateKey, provider);
 
     this.kv = new KvViews(this.storage, this.wallet.address);
-    this.vector = new VectorIndex(this.kv, this.agentId);
+    this.vector =
+      config._vector ??
+      (config.postgresUrl
+        ? new PostgresVectorIndex(this.storage, this.agentId, config.postgresUrl)
+        : new VectorIndex(this.kv, this.storage, this.agentId));
 
     this.inference = new InferenceClient({
       privateKey: config.privateKey,
@@ -130,6 +140,7 @@ export class ZeroMem {
     config: ZeroMemConfig & { _storage?: StorageClient }
   ): Promise<ZeroMem> {
     const instance = new ZeroMem(config);
+    await instance.vector.init?.();
     await instance.kv.addBranch(instance.agentId, instance.currentBranch);
     // Best-effort on-chain setup (no-op if no contract configured)
     try {
@@ -153,22 +164,21 @@ export class ZeroMem {
     const ns = opts.ns ?? 'default';
     const tags = opts.tags ?? [];
     const indexNs = `${this.currentBranch}/${ns}`;
-    const now = Date.now();
 
     // 1. Embed first — needed for both dedupe check and storage
     const embedding = await this.inference.embed(text);
+    const ts = Date.now();
 
     // 2. Semantic deduplication — skip write if near-identical memory exists
     if (opts.dedupe !== false) {
       const threshold = opts.dedupeThreshold ?? 0.95;
       const near = await this.vector.search(embedding, { k: 1, namespace: indexNs });
       if (near.length > 0 && near[0].score >= threshold) {
-        return near[0].commitId; // return existing, no write
+        return near[0].commitId;
       }
     }
 
-    // 3. Build and encrypt payload
-    const payload = { text, embedding, ts: now, tags };
+    const payload = { text, embedding, ts, tags };
     const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
     const payloadRoot = await this.storage.upload(payloadBytes, {
       encrypt: true,
@@ -185,30 +195,26 @@ export class ZeroMem {
       branch: this.currentBranch,
       namespace: ns,
       payloadRoot,
-      metadata: { ts: now, embedding_dim: embedding.length, tags },
+      metadata: {
+        ts,
+        embedding_dim: embedding.length,
+        tags,
+      },
     });
     const commit = await signCommit(partial, this.wallet);
     const commitId = await storeCommit(commit, this.storage);
 
-    // 5. Batch all KV writes into one on-chain transaction
-    const isFirstCommit = !(await this.kv.getRootCommit(this.agentId, this.currentBranch));
-    const itemCount = await this.kv.getItemCount(this.agentId, indexNs);
-    const shard = Math.floor(itemCount / 256);
-    const existingShard = await this.kv.getShard<import('./types.js').VectorEntry>(this.agentId, indexNs, shard);
-    // Encrypt text before writing to KV — embedding stays plaintext for search
-    const encryptedText = encryptKvText(text, this.kvSymKey);
-    const newEntry: import('./types.js').VectorEntry = { commitId, text: encryptedText, embedding, ts: now, tags, namespace: indexNs };
-    const updatedShard = [...existingShard, newEntry].slice(-256);
-
-    const pairs: Array<{ key: string; value: Uint8Array }> = [
-      { key: this.kv.headKey(this.agentId, this.currentBranch), value: new TextEncoder().encode(commitId) },
-      { key: this.kv.itemCountKey(this.agentId, indexNs), value: new TextEncoder().encode(String(itemCount + 1)) },
-      { key: this.kv.shardKey(this.agentId, indexNs, shard), value: new TextEncoder().encode(JSON.stringify(updatedShard)) },
-    ];
-    if (isFirstCommit) {
-      pairs.push({ key: this.kv.rootCommitKey(this.agentId, this.currentBranch), value: new TextEncoder().encode(commitId) });
-    }
-    await this.kv.batch(pairs);
+    await this.kv.setHead(this.agentId, this.currentBranch, commitId);
+    await this.kv.setRootCommitIfAbsent(this.agentId, this.currentBranch, commitId);
+    await this.vector.insert({
+      commitId,
+      text,
+      embedding,
+      payloadRoot,
+      ts,
+      tags,
+      namespace: indexNs,
+    });
 
     return commitId;
   }
@@ -257,11 +263,10 @@ export class ZeroMem {
       }
     }
 
-    // Fetch the MemoryCapsule from 0G Storage to get the unwrapped kvSymKey
-    let grantorSymKey: Buffer = Buffer.alloc(32); // fallback: all-zeros (won't decrypt)
+    let grantorSymKey: Buffer = Buffer.alloc(32);
     if (grantRecord.capsuleRoot) {
       try {
-        const { capsule, kvSymKey } = await this.grants.getCapsule({
+        const { kvSymKey } = await this.grants.getCapsule({
           grantId: record.grantId,
           granterAddress: from,
           capsuleRoot: grantRecord.capsuleRoot,
@@ -269,13 +274,15 @@ export class ZeroMem {
         });
         grantorSymKey = kvSymKey;
       } catch {
-        // capsule unavailable — fall through with empty key (reads will fail gracefully)
+        // capsule unavailable — fall through with empty key (reads may fail gracefully)
       }
     }
 
     const granterAgentId = record.granterAgentId;
-    const grantorKv = new KvViews(this.storage, from);
-    const grantorVector = new VectorIndex(grantorKv, granterAgentId);
+    const grantorVector: MemoryIndex = this.postgresUrl
+      ? new PostgresVectorIndex(this.storage, granterAgentId, this.postgresUrl)
+      : new VectorIndex(new KvViews(this.storage, from), this.storage, granterAgentId);
+    await grantorVector.init?.();
     const indexNs = `main/${ns}`;
     const queryEmbedding = await this.inference.embed(query);
     const hits = await grantorVector.search(queryEmbedding, { k, namespace: indexNs });
@@ -305,7 +312,7 @@ export class ZeroMem {
     Object.assign(child, {
       storage: this.storage,
       kv: this.kv,
-      vector: new VectorIndex(this.kv, this.agentId),
+      vector: this.vector,
       inference: this.inference,
       grants: this.grants,
       skills: this.skills,
@@ -314,6 +321,7 @@ export class ZeroMem {
       currentBranch: name,
       privateKey: this.privateKey,
       kvSymKey: this.kvSymKey,
+      postgresUrl: this.postgresUrl,
       frozen: false,
     });
     return child;
@@ -354,6 +362,7 @@ export class ZeroMem {
       currentBranch: `replay/${opts.at.slice(0, 8)}`,
       privateKey: this.privateKey,
       kvSymKey: this.kvSymKey,
+      postgresUrl: this.postgresUrl,
       frozen: true,
     });
     return snapshot;
@@ -393,12 +402,8 @@ export class ZeroMem {
     );
   }
 
-  // ── Reflector ──────────────────────────────────────────────────────────────
+  // ── Ask / Planner ─────────────────────────────────────────────────────────
 
-  /**
-   * Compact episodic → semantic: reads recent commits, runs sealed-inference
-   * reflection, writes a 'reflect' commit with the semantic summary.
-   */
   /**
    * Compact episodic → semantic.
    *
@@ -410,11 +415,8 @@ export class ZeroMem {
     const head = await this.kv.getHead(this.agentId, this.currentBranch);
     if (!head) return '';
 
-    // Incremental cutoff: use the later of (lastReflect timestamp) and (since window)
     const lastReflectTs = await this.kv.getLastReflectTs(this.agentId, this.currentBranch);
-    const sinceWindowMs  = parseSince(opts.since ?? '24h');
-    // If we've reflected before and it's more recent than the since-window, use it.
-    // force:true skips this and re-processes the full since-window.
+    const sinceWindowMs = parseSince(opts.since ?? '24h');
     const cutoffMs = (!opts.force && lastReflectTs > sinceWindowMs)
       ? lastReflectTs
       : sinceWindowMs;
@@ -422,7 +424,6 @@ export class ZeroMem {
     const recentTexts: string[] = [];
     for await (const { commit } of walkCommits(head, this.storage, this.privateKey)) {
       if (commit.op !== 'remember') continue;
-      // Stop at commits older than our cutoff (DAG is newest-first)
       if (commit.metadata.ts <= cutoffMs) break;
       try {
         const data = await this.storage.download(commit.payload_root, {
@@ -440,13 +441,11 @@ export class ZeroMem {
     const reflectStartTs = Date.now();
     const summary = await this.inference.reflect(recentTexts);
 
-    // Store the semantic summary as a remember commit so it's searchable
     await this.remember(summary, {
       ns: 'semantic',
       tags: ['reflect', `since:${new Date(cutoffMs).toISOString()}`],
     });
 
-    // Write the formal 'reflect' commit with metadata
     const payloadBytes = new TextEncoder().encode(
       JSON.stringify({ summary, sourceCount: recentTexts.length, cutoffMs })
     );
@@ -468,7 +467,6 @@ export class ZeroMem {
     const commit = await signCommit(partial, this.wallet);
     const commitId = await storeCommit(commit, this.storage);
 
-    // Batch: update HEAD + persist last-reflect timestamp in one tx
     await this.kv.batch([
       { key: this.kv.headKey(this.agentId, this.currentBranch), value: new TextEncoder().encode(commitId) },
       { key: this.kv.lastReflectKey(this.agentId, this.currentBranch), value: new TextEncoder().encode(String(reflectStartTs)) },
@@ -477,7 +475,14 @@ export class ZeroMem {
     return commitId;
   }
 
-  // ── Planner ────────────────────────────────────────────────────────────────
+  async ask(question: string, opts: AskOpts = {}): Promise<AskResult> {
+    const hits = await this.recall(question, opts);
+    const answer = await this.inference.answer(
+      question,
+      hits.map((h) => h.text)
+    );
+    return { answer, hits };
+  }
 
   async plan(goal: string): Promise<Plan> {
     const context = await this.recall(goal, { k: 5 });
@@ -503,7 +508,7 @@ export class ZeroMem {
       parent,
       agentId: this.agentId,
       authorPubkey: this.storage.pubKey,
-      op: 'reflect',
+      op: 'plan',
       branch: this.currentBranch,
       namespace: 'plans',
       payloadRoot,
@@ -658,8 +663,8 @@ export class ZeroMem {
               embedding: payload.embedding,
               ts: commit.metadata.ts,
               tags: payload.tags ?? [],
-              // Use branch-qualified namespace to match what remember() writes
               namespace: `${commit.branch}/${commit.namespace}`,
+              payloadRoot: commit.payload_root,
             });
           }
         } catch {
@@ -897,20 +902,32 @@ export class ZeroMem {
     const totalShards = Math.max(1, Math.ceil(itemCount / 256) + 1);
     const shards = await Promise.all(
       Array.from({ length: totalShards }, (_, s) =>
-        this.kv.getShard<import('./types.js').VectorEntry>(this.agentId, indexNs, s)
+        this.kv.getShard<import('./types.js').VectorRef>(this.agentId, indexNs, s)
       )
     );
 
     let count = 0;
-    for (const entries of shards) {
-      for (const e of entries) {
-        const matchesTags =
-          !opts.tags || opts.tags.every((t) => e.tags.includes(t));
-        const matchesTime =
-          untilMs === 0 || e.ts < untilMs;
-        if (matchesTags && matchesTime) {
-          await this.forget(e.commitId);
-          count++;
+    for (const refs of shards) {
+      for (const ref of refs) {
+        try {
+          const data = await this.storage.download(ref.rootHash, {
+            privateKey: this.privateKey,
+          });
+          const e = JSON.parse(new TextDecoder().decode(data)) as {
+            ts: number;
+            tags: string[];
+            commitId: string;
+          };
+          const matchesTags =
+            !opts.tags || opts.tags.every((t) => e.tags.includes(t));
+          const matchesTime =
+            untilMs === 0 || e.ts < untilMs;
+          if (matchesTags && matchesTime) {
+            await this.forget(ref.commitId);
+            count++;
+          }
+        } catch {
+          continue;
         }
       }
     }
@@ -1004,7 +1021,6 @@ export class ZeroMem {
   }
 }
 
-// Also export PlanTask type for getPlan/completePlanTask
 type PlanTask = import('./types.js').PlanTask;
 
 function parseSince(since: string): number {

@@ -5,7 +5,7 @@
  *   - Researcher (Agent A): gathers and stores research findings
  *   - Writer    (Agent B): granted read access to Researcher's memory
  *
- * Demonstrates: remember → recall → branch → grant → revoke → reflect
+ * Demonstrates: remember → recall → ask → branch → grant → revoke
  */
 
 import 'dotenv/config';
@@ -26,6 +26,7 @@ async function main() {
     rpcUrl: process.env.ZG_RPC,
     indexerUrl: process.env.ZG_INDEXER,
     kvUrl: process.env.ZG_KV_URL,
+    postgresUrl: process.env.POSTGRES_URL,
     computeEndpoint: process.env.ZG_COMPUTE_ENDPOINT,
     computeProviderAddress: process.env.ZG_COMPUTE_PROVIDER,
     grantRegistryAddress: process.env.GRANT_REGISTRY_ADDRESS,
@@ -66,10 +67,10 @@ async function main() {
   }
   console.log();
 
-  // ── Step 4: Reflect (episodic → semantic) ────────────────────────────────
-  console.log('5. Researcher running reflector (episodic → semantic)...');
-  const reflectId = await researcher.reflect({ since: '1h' });
-  console.log(`   Reflect commit: ${reflectId?.slice(0, 12) ?? 'skipped (no inference endpoint)'}...\n`);
+  // ── Step 4: Ask (recall + answer) ────────────────────────────────────────
+  console.log('5. Researcher asking a question over recalled memory...');
+  const askResult = await researcher.ask('How does 0G storage work and why is it useful?', { k: 3 });
+  console.log(`   Answer: ${askResult.answer}\n`);
 
   // ── Step 5: Plan ─────────────────────────────────────────────────────────
   console.log('6. Researcher generating a plan...');
@@ -109,6 +110,7 @@ async function main() {
     rpcUrl: process.env.ZG_RPC,
     indexerUrl: process.env.ZG_INDEXER,
     kvUrl: process.env.ZG_KV_URL,
+    postgresUrl: process.env.POSTGRES_URL,
     computeEndpoint: process.env.ZG_COMPUTE_ENDPOINT,
     computeProviderAddress: process.env.ZG_COMPUTE_PROVIDER,
     grantRegistryAddress: process.env.GRANT_REGISTRY_ADDRESS,

@@ -129,16 +129,40 @@ export class InferenceClient {
     const combined = memories.join('\n---\n');
     try {
       return await this.chat([
-      {
-        role: 'system',
-        content:
-          'You are a memory reflector. Consolidate these episodic memories into a semantic summary that captures enduring facts, preferences, and patterns. Be concise.',
-      },
-      { role: 'user', content: combined },
-    ]);
+        {
+          role: 'system',
+          content:
+            'You are a memory reflector. Consolidate these episodic memories into a semantic summary that captures enduring facts, preferences, and patterns. Be concise.',
+        },
+        { role: 'user', content: combined },
+      ]);
     } catch (e: any) {
       if (e?.message === 'NO_INFERENCE_ENDPOINT') {
         return '(reflector unavailable: ZG_COMPUTE_ENDPOINT not set)';
+      }
+      throw e;
+    }
+  }
+
+  /** Answer a question using recalled memory context */
+  async answer(question: string, memories: string[]): Promise<string> {
+    const combined = memories.map((m, i) => `[${i + 1}] ${m}`).join('\n');
+    try {
+      return await this.chat([
+        {
+          role: 'system',
+          content:
+            'You answer questions using only the supplied memory context when possible. Be concise. If the context is insufficient, say so plainly.',
+        },
+        {
+          role: 'user',
+          content: `Question: ${question}\n\nMemory context:\n${combined || '(none)'}`,
+        },
+      ]);
+    } catch (e: any) {
+      if (e?.message === 'NO_INFERENCE_ENDPOINT') {
+        if (memories.length === 0) return 'No relevant memories found.';
+        return `Inference unavailable. Relevant memories:\n${combined}`;
       }
       throw e;
     }

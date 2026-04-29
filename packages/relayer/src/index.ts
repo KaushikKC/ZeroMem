@@ -10,7 +10,7 @@ import { ZeroMem } from '@zeromem/sdk';
  *
  * POST /remember   { agentId, text, ns?, tags? }
  * POST /recall     { agentId, query, k?, ns? }
- * POST /reflect    { agentId, since? }
+ * POST /ask        { agentId, question, k?, ns?, from? }
  * POST /grant      { agentId, to, toPubKey?, scope, ttl }
  * POST /revoke     { agentId, grantId }
  * GET  /health
@@ -34,6 +34,7 @@ async function getInstance(agentId: string): Promise<ZeroMem> {
     rpcUrl: process.env.ZG_RPC,
     indexerUrl: process.env.ZG_INDEXER,
     kvUrl: process.env.ZG_KV_URL,
+    postgresUrl: process.env.POSTGRES_URL,
     computeProviderAddress: process.env.ZG_COMPUTE_PROVIDER,
     computeEndpoint: process.env.ZG_COMPUTE_ENDPOINT,
     grantRegistryAddress: process.env.GRANT_REGISTRY_ADDRESS,
@@ -80,12 +81,18 @@ app.post('/recall', async (req, res) => {
   }
 });
 
-app.post('/reflect', async (req, res) => {
+app.post('/ask', async (req, res) => {
   try {
-    const { agentId, since } = req.body as { agentId: string; since?: string };
+    const { agentId, question, k, ns, from } = req.body as {
+      agentId: string;
+      question: string;
+      k?: number;
+      ns?: string;
+      from?: string;
+    };
     const mem = await getInstance(agentId);
-    const commitId = await mem.reflect({ since });
-    res.json({ commitId });
+    const result = await mem.ask(question, { k, ns, from });
+    res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

@@ -1,15 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ZeroMem } from '@zeromem/sdk';
 
-// Server-side ZeroMem instance cache
 const instances = new Map<string, ZeroMem>();
 
-async function getInstance(agentId: string): Promise<ZeroMem> {
-  if (instances.has(agentId)) return instances.get(agentId)!;
+async function getInstance(agentId: string, branch = 'main'): Promise<ZeroMem> {
+  const key = `${agentId}::${branch}`;
+  if (instances.has(key)) return instances.get(key)!;
   const mem = await ZeroMem.create({
     privateKey: process.env.ZG_PRIVATE_KEY!,
     agentId,
-    branch: 'main',
+    branch,
     rpcUrl: process.env.ZG_RPC,
     indexerUrl: process.env.ZG_INDEXER,
     kvUrl: process.env.ZG_KV_URL,
@@ -17,36 +17,86 @@ async function getInstance(agentId: string): Promise<ZeroMem> {
     computeProviderAddress: process.env.ZG_COMPUTE_PROVIDER,
     grantRegistryAddress: process.env.GRANT_REGISTRY_ADDRESS,
   });
-  instances.set(agentId, mem);
+  instances.set(key, mem);
   return mem;
 }
+
+function ok(data: unknown) { return NextResponse.json(data); }
+function err(msg: string, status = 500) { return NextResponse.json({ error: msg }, { status }); }
 
 export async function POST(
   request: NextRequest,
   { params }: { params: { action: string } }
 ) {
-  const body = await request.json();
-  const { agentId } = body as { agentId: string };
-  if (!agentId) return NextResponse.json({ error: 'agentId required' }, { status: 400 });
+  const body = await request.json().catch(() => ({}));
+  const { agentId = 'demo-agent', branch = 'main' } = body as { agentId?: string; branch?: string };
 
   try {
-    const mem = await getInstance(agentId);
+    const mem = await getInstance(agentId, branch);
 
     switch (params.action) {
+
+      // ── Memory ──────────────────────────────────────────────────────────────
+
       case 'remember': {
-        const commitId = await mem.remember(body.text, { ns: body.ns, tags: body.tags });
-        return NextResponse.json({ commitId });
+        const commitId = await mem.remember(body.text, {
+          ns: body.ns,
+          tags: body.tags,
+          dedupe: body.dedupe ?? false,
+        });
+        return ok({ commitId });
       }
+
       case 'recall': {
-        const hits = await mem.recall(body.query, { k: body.k ?? 5, ns: body.ns });
-        return NextResponse.json({ hits });
+        const hits = await mem.recall(body.query, {
+          k: body.k ?? 5,
+          ns: body.ns,
+          from: body.from,
+        });
+        return ok({ hits });
       }
-      case 'reflect': {
-        const commitId = await mem.reflect({ since: body.since });
-        return NextResponse.json({ commitId });
+
+      case 'ask': {
+        const result = await mem.ask(body.question, {
+          k: body.k ?? 5,
+          ns: body.ns,
+          from: body.from,
+        });
+        return ok(result);
       }
+
+      case 'search': {
+        const hits = await mem.search({
+          query: body.query,
+          k: body.k ?? 5,
+          ns: body.ns,
+          tags: body.tags,
+          since: body.since,
+          until: body.until,
+          minScore: body.minScore ? parseFloat(body.minScore) : undefined,
+          recencyWeight: body.recencyWeight ? parseFloat(body.recencyWeight) : undefined,
+        });
+        return ok({ hits });
+      }
+
+      case 'forget': {
+        await mem.forget(body.commitId);
+        return ok({ ok: true });
+      }
+
+      case 'forgetBulk': {
+        const removed = await mem.forgetBulk({
+          tags: body.tags,
+          olderThan: body.olderThan,
+          ns: body.ns,
+        });
+        return ok({ removed });
+      }
+
+      // ── Git ─────────────────────────────────────────────────────────────────
+
       case 'log': {
-        const raw = await mem.log({ limit: body.limit ?? 10 });
+        const raw = await mem.log({ limit: body.limit ?? 15 });
         const commits = await Promise.all(
           raw.map(async ({ commitId, commit }) => {
             let text = '';
@@ -55,34 +105,182 @@ export async function POST(
                 privateKey: process.env.ZG_PRIVATE_KEY,
               } as any);
               const payload = JSON.parse(new TextDecoder().decode(data));
-              text = payload.text ?? payload.summary ?? '';
+              text = payload.text ?? payload.summary ?? payload.goal ?? '';
             } catch {}
-            return { commitId, text, op: commit.op, ts: commit.metadata.ts };
+            return {
+              commitId,
+              text: text.slice(0, 100),
+              op: commit.op,
+              branch: commit.branch,
+              ns: commit.namespace,
+              ts: commit.metadata.ts,
+              tags: commit.metadata.tags ?? [],
+            };
           })
         );
-        return NextResponse.json({ commits });
+        return ok({ commits });
       }
+
+      case 'branch': {
+        const child = await mem.branch(body.name);
+        // Cache the branched instance
+        instances.set(`${agentId}::${body.name}`, child);
+        return ok({ branch: body.name, currentBranch: child.currentBranch });
+      }
+
+      case 'merge': {
+        await mem.merge(body.from, { strategy: body.strategy ?? 'fast-forward' });
+        return ok({ ok: true, merged: body.from, into: mem.currentBranch });
+      }
+
+      case 'diff': {
+        const result = await mem.diff(body.branchA, body.branchB);
+        return ok(result);
+      }
+
+      case 'blame': {
+        const result = await mem.blame(body.keyword);
+        return ok({ matches: result });
+      }
+
+      case 'replay': {
+        const snap = await mem.replay({ at: body.commitId });
+        return ok({ branch: snap.currentBranch, frozen: true });
+      }
+
+      case 'snapshot': {
+        await mem.snapshot(body.name);
+        return ok({ name: body.name });
+      }
+
+      case 'checkout': {
+        const snap = await mem.checkout(body.name);
+        return ok({ branch: snap.currentBranch, frozen: true });
+      }
+
+      // ── Reflect & Plan ───────────────────────────────────────────────────────
+
+      case 'reflect': {
+        const commitId = await mem.reflect({ since: body.since ?? '1h', force: body.force });
+        return ok({ commitId });
+      }
+
       case 'plan': {
         const plan = await mem.plan(body.goal);
-        return NextResponse.json({ plan });
+        return ok({ plan });
       }
+
+      case 'getPlan': {
+        const plan = await mem.getPlan(body.commitId);
+        return ok({ plan });
+      }
+
+      case 'completePlanTask': {
+        const newCommitId = await mem.completePlanTask(body.planCommitId, body.taskId);
+        return ok({ commitId: newCommitId });
+      }
+
+      // ── Grants ───────────────────────────────────────────────────────────────
+
       case 'grant': {
         const grantId = await mem.grant({
           to: body.to,
           toPubKey: body.toPubKey,
-          scope: body.scope,
-          ttl: body.ttl,
+          scope: body.scope ?? 'default',
+          ttl: body.ttl ?? '24h',
+          tier: body.tier ?? 'READ_FULL',
         });
-        return NextResponse.json({ grantId });
+        return ok({ grantId });
       }
+
+      case 'batchGrant': {
+        const grantIds = await mem.batchGrant({
+          recipients: body.recipients,
+          scope: body.scope ?? 'default',
+          ttl: body.ttl ?? '24h',
+          tier: body.tier ?? 'READ_FULL',
+        });
+        return ok({ grantIds });
+      }
+
       case 'revoke': {
-        await mem.revoke(body.grantId);
-        return NextResponse.json({ ok: true });
+        await mem.revoke(body.grantId, { scope: body.scope, to: body.to });
+        return ok({ ok: true });
       }
+
+      case 'createChallenge': {
+        const challenge = await mem.createAccessChallenge(body.recipientAddress, body.scope ?? 'default');
+        return ok({ challenge });
+      }
+
+      case 'signChallenge': {
+        const proof = await ZeroMem.signAccessChallenge(
+          process.env.ZG_PRIVATE_KEY!,
+          body.challenge
+        );
+        return ok({ proof });
+      }
+
+      case 'grantVerified': {
+        const grantId = await mem.grantVerified({
+          challenge: body.challenge,
+          proof: body.proof,
+          toPubKey: body.toPubKey,
+          ttl: body.ttl ?? '24h',
+          tier: body.tier ?? 'READ_FULL',
+        });
+        return ok({ grantId });
+      }
+
+      // ── System ───────────────────────────────────────────────────────────────
+
+      case 'stats': {
+        const stats = await mem.stats();
+        return ok({ stats });
+      }
+
+      case 'gc': {
+        const result = await mem.gc({ ns: body.ns });
+        return ok(result);
+      }
+
+      case 'prove': {
+        const proof = await mem.prove(body.commitId);
+        return ok({ proof });
+      }
+
+      case 'restore': {
+        await mem.restore(body.branch, { tipCommitId: body.tipCommitId });
+        // Invalidate cache so next call re-reads rebuilt KV
+        instances.delete(`${agentId}::${body.branch ?? 'main'}`);
+        return ok({ ok: true });
+      }
+
+      // ── Skills ───────────────────────────────────────────────────────────────
+
+      case 'skillAdd': {
+        const blobRoot = await mem.skills.add({
+          name: body.name,
+          code: body.code,
+          schema: body.schema ?? {},
+        });
+        return ok({ blobRoot, name: body.name });
+      }
+
+      case 'skillList': {
+        const names = await mem.skills.list();
+        return ok({ skills: names });
+      }
+
+      case 'skillRun': {
+        const result = await mem.skills.run(body.name, body.input ?? {});
+        return ok({ result });
+      }
+
       default:
-        return NextResponse.json({ error: 'Unknown action' }, { status: 404 });
+        return err(`Unknown action: ${params.action}`, 404);
     }
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+  } catch (e: any) {
+    return err(e.message ?? 'Internal error');
   }
 }

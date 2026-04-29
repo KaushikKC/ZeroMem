@@ -1,6 +1,30 @@
 import { Indexer, MemData, KvClient } from '@0gfoundation/0g-ts-sdk';
 import { ethers } from 'ethers';
 import { DEFAULTS } from './types.js';
+import { ZeroMemStorageError } from './errors.js';
+
+/** Exponential backoff: attempt fn up to `attempts` times */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  attempts = 3,
+  baseDelayMs = 500
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) {
+        await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** i));
+      }
+    }
+  }
+  throw new ZeroMemStorageError(
+    `Operation failed after ${attempts} attempts`,
+    lastErr
+  );
+}
 
 export interface UploadOpts {
   encrypt?: boolean;
@@ -84,8 +108,12 @@ export class StorageClient {
     return Array.from(byShard.values());
   }
 
-  /** Upload arbitrary bytes, optionally ECIES-encrypted to recipient */
+  /** Upload arbitrary bytes, optionally ECIES-encrypted to recipient (3 retries) */
   async upload(data: Uint8Array, opts: UploadOpts = {}): Promise<string> {
+    return withRetry(() => this._upload(data, opts));
+  }
+
+  private async _upload(data: Uint8Array, opts: UploadOpts = {}): Promise<string> {
     const memData = new MemData(data);
 
     const sdk: any = await import('@0gfoundation/0g-ts-sdk');
@@ -150,8 +178,12 @@ export class StorageClient {
     return bytes;
   }
 
-  /** KV write — on-chain transaction */
+  /** KV write — on-chain transaction (3 retries) */
   async kvSet(streamId: string, pairs: Array<{ key: string; value: Uint8Array }>): Promise<void> {
+    return withRetry(() => this._kvSet(streamId, pairs));
+  }
+
+  private async _kvSet(streamId: string, pairs: Array<{ key: string; value: Uint8Array }>): Promise<void> {
     const sdk: any = await import('@0gfoundation/0g-ts-sdk');
     const { Batcher, FixedPriceFlow__factory } = sdk;
 

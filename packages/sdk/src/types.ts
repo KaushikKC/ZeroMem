@@ -77,6 +77,73 @@ export interface PlanTask {
   done: boolean;
 }
 
+/** Options for mem.search() — richer than recall() */
+export interface SearchOpts {
+  query: string;
+  k?: number;
+  ns?: string;
+  /** Only return entries that contain ALL of these tags */
+  tags?: string[];
+  /** Only entries newer than this (e.g. '7d', '1h') */
+  since?: string;
+  /** Only entries older than this (e.g. '1d') */
+  until?: string;
+  /** Minimum cosine score (0–1) */
+  minScore?: number;
+  /** 0–1: weight recency vs pure semantic similarity. Default 0. */
+  recencyWeight?: number;
+  /** Granter address for cross-agent search */
+  from?: string;
+}
+
+/** Return type of mem.stats() */
+export interface MemStats {
+  agentId: string;
+  currentBranch: string;
+  branches: string[];
+  /** Per branch/namespace item count */
+  namespaceStats: Record<string, number>;
+  skills: string[];
+  headCommitId: string | null;
+  approxTotalMemories: number;
+}
+
+/** Verifiable proof that a commit exists on 0G */
+export interface CommitProof {
+  commitId: string;
+  agentId: string;
+  agentAddress: string;
+  agentPubKey: string;
+  op: string;
+  branch: string;
+  payloadRoot: string;
+  ts: number;
+  /** Signature by agent at write time — over the full commit body */
+  commitSig: string;
+  /** Fresh attestation signature — agent signs { commitId, provedAt } now */
+  attestationSig: string;
+  provedAt: number;
+  storageExplorerUrl: string;
+}
+
+/** Return type of mem.diff() */
+export interface DiffResult {
+  branchA: string;
+  branchB: string;
+  /** Commits only in A (not in B) */
+  onlyInA: Array<{ commitId: string; op: string; ts: number; branch: string }>;
+  /** Commits only in B (not in A) */
+  onlyInB: Array<{ commitId: string; op: string; ts: number; branch: string }>;
+  /** Most recent common ancestor commitId */
+  divergedAt: string | null;
+}
+
+/** Return type of mem.gc() */
+export interface GcResult {
+  removed: number;
+  namespacesScanned: string[];
+}
+
 export interface ZeroMemConfig {
   privateKey: string;
   agentId: string;

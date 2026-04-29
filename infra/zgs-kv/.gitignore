@@ -1,0 +1,6 @@
+config.toml
+zgs_kv
+zgs_kv_linux.zip
+zgs_kv.log
+db/
+kv.DB

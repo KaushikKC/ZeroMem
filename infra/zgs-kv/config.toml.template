@@ -1,0 +1,54 @@
+########################################################################
+###              ZeroMem — zgs_kv config template                   ###
+###  Copy to config.toml and fill in the placeholders below.        ###
+###  Run: bash setup.sh  to generate config.toml from .env          ###
+########################################################################
+
+#######################################################################
+###                   Key-Value Stream Options                      ###
+#######################################################################
+
+# Stream IDs to monitor (one per agent wallet).
+# Value = keccak256("zeromem:" + lowercase(walletAddress)) without 0x prefix.
+# Generate with: node -e "const {ethers}=require('ethers'); console.log(ethers.keccak256(ethers.toUtf8Bytes('zeromem:'+process.env.WALLET_ADDR.toLowerCase())).slice(2))"
+stream_ids = ["<STREAM_ID_WITHOUT_0X>"]
+
+#######################################################################
+###                     DB Config Options                           ###
+#######################################################################
+
+db_dir = "db"
+kv_db_file = "kv.DB"
+
+#######################################################################
+###                     Log Sync Config Options                     ###
+#######################################################################
+
+blockchain_rpc_endpoint = "https://evmrpc-testnet.0g.ai"
+log_contract_address = "0x22E03a6A89B950F1c82ec5e74F8eCa321a105296"
+
+# Set to a recent block to skip syncing from genesis (saves hours).
+# Find current block at https://chainscan-galileo.0g.ai
+log_sync_start_block_number = 1
+
+#######################################################################
+###                     RPC Config Options                          ###
+#######################################################################
+
+rpc_enabled = true
+rpc_listen_address = "0.0.0.0:6789"
+indexer_url = "https://indexer-storage-testnet-turbo.0g.ai:443"
+zgs_node_urls = ""
+
+#######################################################################
+###                     Encryption Options                          ###
+#######################################################################
+
+# Must match the wallet private key used for stream writes (without 0x prefix).
+encryption_key = "<PRIVATE_KEY_WITHOUT_0X>"
+
+#######################################################################
+###                     Misc Config Options                         ###
+#######################################################################
+
+log_config_file = "log_config"

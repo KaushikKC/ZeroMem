@@ -7,6 +7,7 @@ export interface ZeroMemPluginConfig {
   rpc?: string;
   indexer?: string;
   kvUrl?: string;
+  postgresUrl?: string;
   grantRegistryAddress?: string;
 
   autoRecall?: boolean;
@@ -18,11 +19,12 @@ export interface ZeroMemPluginConfig {
 
 export interface PluginContext {
   mem: ZeroMem;
-  cfg: Required<Omit<ZeroMemPluginConfig, 'agentId' | 'rpc' | 'indexer' | 'kvUrl' | 'grantRegistryAddress'>> & {
+  cfg: Required<Omit<ZeroMemPluginConfig, 'agentId' | 'rpc' | 'indexer' | 'kvUrl' | 'postgresUrl' | 'grantRegistryAddress'>> & {
     agentId?: string;
     rpc?: string;
     indexer?: string;
     kvUrl?: string;
+    postgresUrl?: string;
     grantRegistryAddress?: string;
   };
 }

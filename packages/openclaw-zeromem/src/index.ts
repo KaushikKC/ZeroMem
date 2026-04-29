@@ -73,6 +73,7 @@ export async function createZeroMemPlugin(
     rpcUrl: resolveEnv(raw.rpc),
     indexerUrl: resolveEnv(raw.indexer),
     kvUrl: resolveEnv(raw.kvUrl),
+    postgresUrl: resolveEnv(raw.postgresUrl),
     grantRegistryAddress: resolveEnv(raw.grantRegistryAddress),
   });
 
@@ -82,6 +83,7 @@ export async function createZeroMemPlugin(
     rpc: raw.rpc,
     indexer: raw.indexer,
     kvUrl: raw.kvUrl,
+    postgresUrl: raw.postgresUrl,
     grantRegistryAddress: raw.grantRegistryAddress,
     defaultNamespace: raw.defaultNamespace ?? PLUGIN_DEFAULTS.defaultNamespace,
     autoRecall: raw.autoRecall ?? PLUGIN_DEFAULTS.autoRecall,

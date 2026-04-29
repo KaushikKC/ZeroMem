@@ -1,5 +1,7 @@
-import type { VectorEntry, RecallResult, SearchOpts } from './types.js';
+import type { MemoryIndex } from './memory-index.js';
+import type { VectorEntry, VectorRef, RecallResult } from './types.js';
 import type { KvViews } from './kv-views.js';
+import type { StorageClient } from './storage.js';
 
 const MAX_PER_SHARD = 256;
 const RECENCY_HALF_LIFE_MS = 30 * 24 * 3600 * 1000; // 30-day half-life
@@ -25,41 +27,47 @@ function parseSinceMs(since: string): number {
   if (!m) return 0;
   const n = parseInt(m[1], 10);
   const unit = m[2];
-  const ms = unit === 's' ? n * 1000 : unit === 'm' ? n * 60_000 : unit === 'h' ? n * 3_600_000 : n * 86_400_000;
+  const ms =
+    unit === 's' ? n * 1000 :
+    unit === 'm' ? n * 60_000 :
+    unit === 'h' ? n * 3_600_000 :
+    n * 86_400_000;
   return Date.now() - ms;
 }
 
-export class VectorIndex {
+export class VectorIndex implements MemoryIndex {
   constructor(
     private kv: KvViews,
+    private storage: StorageClient,
     private agentId: string
   ) {}
 
   /**
    * Insert a vector entry.
-   * Shard index is derived from the persisted item count so restarts always
-   * land in the correct bucket even after a KV wipe + restore.
+   * Embeddings live in Log blobs; KV shards store only small VectorRef records.
    */
-  async insert(entry: VectorEntry): Promise<void> {
+  async insert(entry: VectorEntry & { payloadRoot?: string }): Promise<void> {
     const count = await this.kv.getItemCount(this.agentId, entry.namespace);
     const shard = Math.floor(count / MAX_PER_SHARD);
+    const bytes = new TextEncoder().encode(JSON.stringify(entry));
+    // Vector entries are stored UNENCRYPTED — they are index data (embeddings +
+    // text snippet), not sensitive payload. Commit payload blobs are ECIES-protected.
+    // Storing unencrypted makes cross-agent recall work: recipient can read
+    // granter's index without needing the granter's private key.
+    const rootHash = await this.storage.upload(bytes);
 
-    await this.kv.appendToShard(this.agentId, entry.namespace, shard, [entry]);
+    await this.kv.appendToShard<VectorRef>(this.agentId, entry.namespace, shard, [
+      { commitId: entry.commitId, rootHash },
+    ]);
     await this.kv.incrementItemCount(this.agentId, entry.namespace);
   }
 
-  /**
-   * Find top-k entries by cosine similarity across all shards.
-   * Shards are fetched in parallel for speed.
-   * Supports optional tag, time, score, and recency filters.
-   */
   async search(
     query: number[],
     opts: {
       k?: number;
       namespace?: string;
       tombstonedIds?: Set<string>;
-      // SearchOpts subset:
       tags?: string[];
       since?: string;
       until?: string;
@@ -79,24 +87,23 @@ export class VectorIndex {
     const itemCount = await this.kv.getItemCount(this.agentId, ns);
     const totalShards = Math.max(1, Math.ceil(itemCount / MAX_PER_SHARD) + 1);
 
-    // Fetch all shards in parallel
     const shardArrays = await Promise.all(
       Array.from({ length: totalShards }, (_, s) =>
-        this.kv.getShard<VectorEntry>(this.agentId, ns, s)
+        this.kv.getShard<VectorRef>(this.agentId, ns, s)
       )
     );
 
     const candidates: Array<VectorEntry & { score: number }> = [];
 
-    for (const entries of shardArrays) {
-      for (const e of entries) {
+    for (const refs of shardArrays) {
+      for (const ref of refs) {
+        if (tombstoned.has(ref.commitId)) continue;
+        const e = await this.loadEntry(ref.rootHash);
         if (tombstoned.has(e.commitId)) continue;
 
-        // Time filters
         if (sinceMs > 0 && e.ts < sinceMs) continue;
         if (untilMs > 0 && e.ts > untilMs) continue;
 
-        // Tag filter — entry must contain ALL requested tags
         if (opts.tags && opts.tags.length > 0) {
           if (!opts.tags.every((t) => e.tags.includes(t))) continue;
         }
@@ -127,15 +134,14 @@ export class VectorIndex {
     const itemCount = await this.kv.getItemCount(this.agentId, namespace);
     const totalShards = Math.max(1, Math.ceil(itemCount / MAX_PER_SHARD) + 1);
 
-    const shardArrays = await Promise.all(
-      Array.from({ length: totalShards }, (_, s) =>
-        this.kv.getShard<VectorEntry>(this.agentId, namespace, s)
-      )
-    );
-
-    for (let s = 0; s < shardArrays.length; s++) {
-      const filtered = shardArrays[s].filter((e) => e.commitId !== commitId);
-      if (filtered.length !== shardArrays[s].length) {
+    for (let s = 0; s < totalShards; s++) {
+      const refs = await this.kv.getShard<VectorRef>(
+        this.agentId,
+        namespace,
+        s
+      );
+      const filtered = refs.filter((e) => e.commitId !== commitId);
+      if (filtered.length !== refs.length) {
         await this.kv.writeAll(this.agentId, namespace, s, filtered);
       }
     }
@@ -146,14 +152,14 @@ export class VectorIndex {
     const itemCount = await this.kv.getItemCount(this.agentId, srcNamespace);
     const totalShards = Math.max(1, Math.ceil(itemCount / MAX_PER_SHARD) + 1);
 
-    const shardArrays = await Promise.all(
-      Array.from({ length: totalShards }, (_, s) =>
-        this.kv.getShard<VectorEntry>(this.agentId, srcNamespace, s)
-      )
-    );
-
-    for (const entries of shardArrays) {
-      for (const entry of entries) {
+    for (let s = 0; s < totalShards; s++) {
+      const refs = await this.kv.getShard<VectorRef>(
+        this.agentId,
+        srcNamespace,
+        s
+      );
+      for (const ref of refs) {
+        const entry = await this.loadEntry(ref.rootHash);
         await this.insert({ ...entry, namespace: dstNamespace });
       }
     }
@@ -169,28 +175,27 @@ export class VectorIndex {
     const itemCount = await this.kv.getItemCount(this.agentId, namespace);
     const totalShards = Math.max(1, Math.ceil(itemCount / MAX_PER_SHARD) + 1);
 
-    const shardArrays = await Promise.all(
-      Array.from({ length: totalShards }, (_, s) =>
-        this.kv.getShard<VectorEntry>(this.agentId, namespace, s)
-      )
-    );
-
     let removed = 0;
-    for (let s = 0; s < shardArrays.length; s++) {
-      const original = shardArrays[s];
-      const filtered = original.filter((e) => !tombstonedIds.has(e.commitId));
-      if (filtered.length < original.length) {
-        removed += original.length - filtered.length;
+    for (let s = 0; s < totalShards; s++) {
+      const refs = await this.kv.getShard<VectorRef>(this.agentId, namespace, s);
+      const filtered = refs.filter((r) => !tombstonedIds.has(r.commitId));
+      if (filtered.length < refs.length) {
+        removed += refs.length - filtered.length;
         await this.kv.writeAll(this.agentId, namespace, s, filtered);
       }
     }
 
-    // Reset item count to reflect actual surviving entries
     if (removed > 0) {
       const newCount = Math.max(0, itemCount - removed);
       await this.kv.setItemCount(this.agentId, namespace, newCount);
     }
 
     return removed;
+  }
+
+  private async loadEntry(rootHash: string): Promise<VectorEntry> {
+    // No decryption key needed — vector entries are stored unencrypted (see insert)
+    const bytes = await this.storage.download(rootHash);
+    return JSON.parse(new TextDecoder().decode(bytes)) as VectorEntry;
   }
 }

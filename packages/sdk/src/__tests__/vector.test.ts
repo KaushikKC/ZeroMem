@@ -10,7 +10,7 @@ function makeIndex(): { idx: VectorIndex; kv: KvViews } {
     .spyOn(StorageClient, 'streamId')
     .mockImplementation((addr) => MockStorageClient.streamId(addr));
   const kv = new KvViews(store as unknown as StorageClient, '0xTestAgent');
-  const idx = new VectorIndex(kv, 'test-agent');
+  const idx = new VectorIndex(kv, store as unknown as StorageClient, 'test-agent');
   return { idx, kv };
 }
 

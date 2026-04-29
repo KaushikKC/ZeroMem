@@ -1,6 +1,7 @@
 export type CommitOp =
   | 'remember'
   | 'reflect'
+  | 'plan'
   | 'forget'
   | 'skill_add'
   | 'grant'
@@ -27,7 +28,7 @@ export interface ZeroCommit {
   sig: string;
 }
 
-/** Vector entry stored inside a KV index shard */
+/** Vector entry stored as a blob; KV shards keep only its rootHash */
 export interface VectorEntry {
   commitId: string;
   text: string;
@@ -37,12 +38,23 @@ export interface VectorEntry {
   namespace: string;
 }
 
+/** Small KV record pointing to a vector-entry blob */
+export interface VectorRef {
+  commitId: string;
+  rootHash: string;
+}
+
 export interface RecallResult {
   text: string;
   score: number;
   commitId: string;
   ts: number;
   tags: string[];
+}
+
+export interface AskResult {
+  answer: string;
+  hits: RecallResult[];
 }
 
 export interface GrantRecord {
@@ -151,6 +163,7 @@ export interface ZeroMemConfig {
   rpcUrl?: string;
   indexerUrl?: string;
   kvUrl?: string;
+  postgresUrl?: string;
   computeProviderAddress?: string;
   computeEndpoint?: string;
   grantRegistryAddress?: string;

@@ -17,7 +17,7 @@ jest.mock('../inference', () => ({
       Promise.resolve(testEmbed(text, 8))
     ),
     analyze: jest.fn().mockResolvedValue('{"facts":[]}'),
-    reflect: jest.fn().mockResolvedValue('Consolidated semantic summary.'),
+    answer: jest.fn().mockResolvedValue('Answer based on recalled memories.'),
     plan: jest.fn().mockResolvedValue({
       goal: 'test goal',
       tasks: [
@@ -202,12 +202,14 @@ describe('ZeroMem — forget and tombstones', () => {
   });
 });
 
-describe('ZeroMem — reflect', () => {
-  test('reflect resolves without error', async () => {
+describe('ZeroMem — ask', () => {
+  test('ask returns answer plus recalled hits', async () => {
     const mem = await makeAgent(AGENT_A_KEY, 'agent-a', storeA);
     await mem.remember('Fact one about the topic');
     await mem.remember('Fact two about the topic');
-    await expect(mem.reflect({ since: '1h' })).resolves.toBeDefined();
+    const result = await mem.ask('What do you remember about the topic?');
+    expect(result.answer).toContain('Answer based on recalled memories');
+    expect(result.hits.length).toBeGreaterThan(0);
   });
 });
 

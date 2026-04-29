@@ -91,6 +91,79 @@ const pastHits  = await snapshot.recall('what did agent know on Tuesday?');
 // snapshot is read-only (frozen)
 ```
 
+### Rich search with filters
+
+```ts
+const hits = await mem.search({
+  query: 'vector storage',
+  tags: ['0g', 'storage'],   // only entries with ALL these tags
+  since: '7d',               // only last 7 days
+  minScore: 0.4,             // ignore weak matches
+  recencyWeight: 0.2,        // blend recency into score (0–1)
+  k: 10,
+});
+```
+
+### Semantic deduplication (automatic)
+
+```ts
+// Near-identical memories (cosine ≥ 0.95) are skipped — no duplicate write
+const id = await mem.remember('Alice prefers terse replies', { dedupe: true });
+// If this memory already exists, returns existing commitId without any 0G write
+```
+
+### Stats
+
+```ts
+const s = await mem.stats();
+// → { agentId, branches, namespaceStats, skills, headCommitId, approxTotalMemories }
+```
+
+### Garbage collect
+
+```ts
+// Remove tombstoned entries from all KV shards — reclaims storage, speeds up search
+const { removed } = await mem.gc();
+```
+
+### Prove — Merkle attestation
+
+```ts
+const proof = await mem.prove(commitId);
+// → { commitId, agentAddress, commitSig, attestationSig, storageExplorerUrl, ... }
+// commitSig was written at store time; attestationSig is fresh — two-sig proof
+```
+
+### Diff two branches
+
+```ts
+const result = await mem.diff('main', 'experiment-v2');
+// → { onlyInA, onlyInB, divergedAt }
+```
+
+### Named snapshots (Git tags)
+
+```ts
+await mem.snapshot('before-experiment');
+const snap = await mem.checkout('before-experiment'); // frozen read-only ZeroMem
+```
+
+### Plan tracking
+
+```ts
+const plan = await mem.plan('Write release notes for v2');
+await mem.completePlanTask(plan.commitId, 't1');   // mark task done
+const updated = await mem.getPlan(plan.commitId);  // reload
+```
+
+### Bulk forget
+
+```ts
+// Tombstone all session memories older than 30 days
+const removed = await mem.forgetBulk({ ns: 'sessions', olderThan: '30d' });
+await mem.gc(); // actually reclaim the KV space
+```
+
 ### Restore after KV wipe
 
 ```ts

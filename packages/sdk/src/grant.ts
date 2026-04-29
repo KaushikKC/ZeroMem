@@ -1,17 +1,39 @@
 import { ethers } from 'ethers';
 import { KvViews } from './kv-views.js';
 import type { StorageClient } from './storage.js';
+import {
+  createCapsule,
+  verifyCapsule,
+  unwrapKey,
+  decodeCapsule,
+  encodeCapsule,
+  type MemoryCapsule,
+  type AccessTier,
+} from './acl.js';
 
+// Updated ABI to match upgraded GrantRegistry.sol
 const GRANT_REGISTRY_ABI = [
   'function registerAgent(string calldata pubkey) external',
-  'function grant(address to, bytes32 scopeHash, uint256 ttl, bytes32 commitRoot) external returns (bytes32)',
+  'function grant(address to, bytes32 scopeHash, uint256 ttl, bytes32 commitRoot, bytes32 capsuleRoot, uint8 tier) external returns (bytes32)',
+  'function batchGrant(address[] calldata recipients, bytes32 scopeHash, uint256 ttl, bytes32 commitRoot, bytes32[] calldata capsuleRoots, uint8 tier) external returns (bytes32[] memory)',
+  'function delegateGrant(bytes32 parentGrantId, address delegateTo, uint256 subTtl, uint8 subTier, bytes32 capsuleRoot) external returns (bytes32)',
   'function revoke(bytes32 grantId) external',
+  'function revokeAll(address[] calldata recipients, bytes32 scopeHash) external',
   'function isGranted(address from, address to, bytes32 scopeHash) external view returns (bool)',
-  'function grants(bytes32 grantId) external view returns (address from, address to, bytes32 scopeHash, uint256 ttl, bytes32 commitRoot, bool revoked)',
+  'function getAccessTier(address from, address to, bytes32 scopeHash) external view returns (uint8)',
+  'function getGrant(bytes32 grantId) external view returns (address, address, bytes32, uint256, bytes32, bytes32, uint8, bool, bytes32)',
   'event AgentRegistered(address indexed agent, string pubkey)',
-  'event GrantCreated(bytes32 indexed grantId, address indexed from, address indexed to, bytes32 scopeHash, uint256 ttl)',
-  'event GrantRevoked(bytes32 indexed grantId)',
+  'event GrantCreated(bytes32 indexed grantId, address indexed from, address indexed to, bytes32 scopeHash, uint256 ttl, uint8 tier, bytes32 capsuleRoot)',
+  'event GrantRevoked(bytes32 indexed grantId, address indexed revokedBy)',
+  'event GrantDelegated(bytes32 indexed parentGrantId, bytes32 indexed delegateGrantId, address indexed delegateTo, uint8 tier)',
 ];
+
+const TIER_MAP: Record<AccessTier, number> = {
+  READ_SEMANTIC: 1,
+  READ_FULL: 2,
+  ADMIN: 3,
+};
+const TIER_REVERSE: Record<number, AccessTier> = { 1: 'READ_SEMANTIC', 2: 'READ_FULL', 3: 'ADMIN' };
 
 function scopeHash(scope: string): string {
   return ethers.keccak256(ethers.toUtf8Bytes(scope));
@@ -23,11 +45,7 @@ function ttlToTimestamp(ttl: string): bigint {
   if (!m) throw new Error(`Invalid TTL format: ${ttl}. Use e.g. 24h, 30m, 7d`);
   const n = BigInt(m[1]);
   const unit = m[2];
-  const secs =
-    unit === 's' ? n :
-    unit === 'm' ? n * 60n :
-    unit === 'h' ? n * 3600n :
-    n * 86400n;
+  const secs = unit === 's' ? n : unit === 'm' ? n * 60n : unit === 'h' ? n * 3600n : n * 86400n;
   return now + secs;
 }
 
@@ -44,191 +62,224 @@ export class GrantManager {
   ) {}
 
   private getContract(): ethers.Contract {
-    if (!this.registryAddress) {
-      throw new Error('GrantRegistry contract address not configured');
-    }
+    if (!this.registryAddress) throw new Error('GrantRegistry address not configured');
     if (!this.contract) {
       const provider = new ethers.JsonRpcProvider(this.rpcUrl);
       const signer = new ethers.Wallet(this.wallet.privateKey, provider);
-      this.contract = new ethers.Contract(
-        this.registryAddress,
-        GRANT_REGISTRY_ABI,
-        signer
-      );
+      this.contract = new ethers.Contract(this.registryAddress, GRANT_REGISTRY_ABI, signer);
     }
     return this.contract;
   }
 
   async registerAgent(pubkey: string): Promise<void> {
-    try {
-      const contract = this.getContract();
-      const tx = await contract.registerAgent(pubkey);
-      await tx.wait();
-    } catch {
-      // no contract deployed yet
-    }
+    try { const tx = await this.getContract().registerAgent(pubkey); await tx.wait(); } catch {}
   }
 
   /**
-   * Grant read access to a memory scope.
-   * Writes a grant record + reverse-index into the granter's KV stream.
+   * Grant read access to a memory scope using a MemoryCapsule.
+   *
+   * The capsule wraps the granter's KV symmetric key with the recipient's
+   * ECIES public key. Only the recipient can decrypt the memories.
+   * The capsule is stored on 0G Storage as an immutable content-addressed blob.
    */
   async createGrant(opts: {
     from: string;
     granterAgentId: string;
+    granterPubKey: string;
     to: string;
     toPubKey: string;
     scope: string;
     ttl: string;
+    tier?: AccessTier;
     headCommitId: string;
     privateKey: string;
+    kvSymKey: Buffer;
   }): Promise<string> {
-    const { from, granterAgentId, to, toPubKey, scope, ttl, headCommitId, privateKey } = opts;
+    const {
+      from, granterAgentId, granterPubKey, to, toPubKey,
+      scope, ttl, tier = 'READ_FULL', headCommitId, privateKey, kvSymKey,
+    } = opts;
 
-    // Re-encrypt head commit for recipient
-    const data = await this.storage.download(headCommitId, { privateKey });
-    await this.storage.upload(data, {
+    const ttlTimestamp = ttlToTimestamp(ttl);
+
+    // 1. Build MemoryCapsule — wraps kvSymKey with recipient's ECDH key
+    const capsule = await createCapsule({
+      granterAddress: from,
+      granterPubKey,
+      granterPrivKey: privateKey,
+      recipientAddress: to,
+      recipientPubKey: toPubKey,
+      scope,
+      ttl,
+      tier,
+      kvSymKey,
+    });
+
+    // 2. Store capsule as a blob on 0G Storage (encrypted to recipient's pubkey)
+    const capsuleBytes = encodeCapsule(capsule);
+    const capsuleRoot = await this.storage.upload(capsuleBytes, {
       encrypt: true,
       recipientPubKey: toPubKey,
     });
 
-    const ttlTimestamp = ttlToTimestamp(ttl);
-    const sh = scopeHash(scope);
+    // 3. Commit root (keccak of head commitId for on-chain reference)
     const commitRootBytes = ethers.zeroPadValue(
       ethers.toBeHex(ethers.keccak256(ethers.toUtf8Bytes(headCommitId))),
       32
     );
+    const capsuleRootBytes = ethers.zeroPadValue(
+      ethers.toBeHex(ethers.keccak256(ethers.toUtf8Bytes(capsuleRoot))),
+      32
+    );
+    const sh = scopeHash(scope);
+    const tierNum = TIER_MAP[tier];
 
     let grantId: string;
     try {
       const contract = this.getContract();
-      const tx = await contract.grant(to, sh, ttlTimestamp, commitRootBytes);
+      const tx = await contract.grant(to, sh, ttlTimestamp, commitRootBytes, capsuleRootBytes, tierNum);
       const receipt = await tx.wait();
       const event = receipt.logs
-        .map((l: any) => {
-          try { return contract.interface.parseLog(l); } catch { return null; }
-        })
+        .map((l: any) => { try { return contract.interface.parseLog(l); } catch { return null; } })
         .find((e: any) => e?.name === 'GrantCreated');
-      grantId =
-        event?.args?.grantId ??
-        ethers.keccak256(ethers.toUtf8Bytes(`${from}:${to}:${scope}:${Date.now()}`));
+      grantId = event?.args?.grantId ?? fallbackGrantId(from, to, scope);
     } catch {
-      grantId = ethers.keccak256(
-        ethers.toUtf8Bytes(`${from}:${to}:${scope}:${Date.now()}`)
-      );
+      grantId = fallbackGrantId(from, to, scope);
     }
 
-    // Write grant record into granter's KV stream (this.kv = granter's)
-    await this.kv.setGrant(from, to, scope, grantId, Number(ttlTimestamp), granterAgentId);
-
-    // Write reverse-index so event listener can look up from/to/scope by grantId
-    await this.kv.setGrantIndex(grantId, { from, to, scope });
+    // 4. Write to granter's KV: grant record + reverse-index + capsule root
+    await this.kv.batch([
+      {
+        key: this.kv.grantKey(from, to, scope),
+        value: new TextEncoder().encode(
+          JSON.stringify({ grantId, ttl: Number(ttlTimestamp), granterAgentId, tier, capsuleRoot })
+        ),
+      },
+      {
+        key: this.kv.grantIndexKey(grantId),
+        value: new TextEncoder().encode(JSON.stringify({ from, to, scope })),
+      },
+      {
+        key: this.kv.capsuleKey(grantId),
+        value: new TextEncoder().encode(capsuleRoot),
+      },
+    ]);
 
     return grantId;
   }
 
-  /** Revoke a grant — removes from granter's KV + on-chain */
-  async revoke(grantId: string, scope: string, to: string): Promise<void> {
-    try {
-      const contract = this.getContract();
-      const tx = await contract.revoke(grantId);
-      await tx.wait();
-    } catch {
-      // no contract
+  /**
+   * Batch grant to multiple recipients at once.
+   * Creates one capsule per recipient (each has their own wrapped key).
+   */
+  async batchGrant(opts: {
+    from: string;
+    granterAgentId: string;
+    granterPubKey: string;
+    recipients: Array<{ address: string; pubKey: string }>;
+    scope: string;
+    ttl: string;
+    tier?: AccessTier;
+    headCommitId: string;
+    privateKey: string;
+    kvSymKey: Buffer;
+  }): Promise<string[]> {
+    const grantIds: string[] = [];
+    for (const recipient of opts.recipients) {
+      const grantId = await this.createGrant({
+        ...opts,
+        to: recipient.address,
+        toPubKey: recipient.pubKey,
+      });
+      grantIds.push(grantId);
     }
-    // Remove from granter's KV stream
+    return grantIds;
+  }
+
+  /** Revoke a specific grant — removes from KV + on-chain */
+  async revoke(grantId: string, scope: string, to: string): Promise<void> {
+    try { const tx = await this.getContract().revoke(grantId); await tx.wait(); } catch {}
     if (scope && to) {
       await this.kv.removeGrant(this.wallet.address, to, scope);
     } else {
-      // Fall back to reverse-index lookup
       const meta = await this.kv.getGrantIndex(grantId);
-      if (meta) {
-        await this.kv.removeGrant(meta.from, meta.to, meta.scope);
-      }
+      if (meta) await this.kv.removeGrant(meta.from, meta.to, meta.scope);
     }
   }
 
-  /**
-   * Start listening for on-chain GrantRevoked events.
-   * On each event: look up the reverse-index and remove the KV grant entry.
-   * Safe to call multiple times — only wires once.
-   */
+  /** Wire on-chain GrantRevoked event → auto-purge KV */
   async initEventListeners(): Promise<void> {
     if (this.listenerActive) return;
     try {
       const contract = this.getContract();
       this.listenerActive = true;
-
       contract.on('GrantRevoked', async (grantId: string) => {
         try {
-          // Reverse-lookup: grantId → {from, to, scope}
           const meta = await this.kv.getGrantIndex(grantId);
-          if (!meta) return;
-
-          // Remove from granter's KV stream
-          await this.kv.removeGrant(meta.from, meta.to, meta.scope);
-        } catch {
-          // log and continue — listener must never crash
-        }
+          if (meta) await this.kv.removeGrant(meta.from, meta.to, meta.scope);
+        } catch {}
       });
-
-      contract.on('GrantCreated', async (grantId: string, from: string, to: string) => {
-        // Opportunistically cache the index entry in case we missed createGrant
-        try {
-          const existing = await this.kv.getGrantIndex(grantId);
-          if (!existing) {
-            // We only know from/to from the event; scope is unknown without a separate query
-            // Skip — the index is written by createGrant on the granter side
-          }
-        } catch {
-          // ignore
-        }
-      });
-    } catch {
-      this.listenerActive = false;
-      // contract not available — skip
-    }
+    } catch { this.listenerActive = false; }
   }
 
-  /** Stop all contract event listeners */
   stopEventListeners(): void {
-    try {
-      this.contract?.removeAllListeners();
-      this.listenerActive = false;
-    } catch {
-      // ignore
-    }
+    try { this.contract?.removeAllListeners(); this.listenerActive = false; } catch {}
   }
 
-  /**
-   * Check if a grant is still valid.
-   * Reads from the GRANTER's KV stream (stream ID derived from `from` address).
-   */
+  /** Check if a grant is still valid (reads granter's KV stream) */
   async isGranted(from: string, to: string, scope: string): Promise<boolean> {
     const grantorKv = new KvViews(this.storage, from);
     const record = await grantorKv.getGrant(from, to, scope);
-
     if (!record) return false;
     if (record.ttl < Math.floor(Date.now() / 1000)) return false;
-
     try {
-      const contract = this.getContract();
-      return (await contract.isGranted(from, to, scopeHash(scope))) as boolean;
-    } catch {
-      return true; // trust KV if no contract
-    }
+      return (await this.getContract().isGranted(from, to, scopeHash(scope))) as boolean;
+    } catch { return true; }
   }
 
-  /**
-   * Read the full grant record from the granter's KV stream.
-   * `from` must be the granter's EVM wallet address.
-   */
+  /** Read full grant record including capsuleRoot from granter's KV */
   async getGrantRecord(
     from: string,
     to: string,
     scope: string
-  ): Promise<{ grantId: string; ttl: number; granterAgentId: string } | null> {
+  ): Promise<{ grantId: string; ttl: number; granterAgentId: string; tier?: AccessTier; capsuleRoot?: string } | null> {
     const grantorKv = new KvViews(this.storage, from);
-    return grantorKv.getGrant(from, to, scope);
+    return grantorKv.getGrant(from, to, scope) as any;
   }
+
+  /**
+   * Fetch and verify the MemoryCapsule for a grant.
+   * The recipient downloads the capsule blob and unwraps the kvSymKey.
+   */
+  async getCapsule(opts: {
+    grantId: string;
+    granterAddress: string;
+    capsuleRoot: string;
+    recipientPrivKey: string;
+  }): Promise<{ capsule: MemoryCapsule; kvSymKey: Buffer }> {
+    const { capsuleRoot, recipientPrivKey } = opts;
+
+    // Download the capsule blob (encrypted to recipient's pubkey)
+    const capsuleBytes = await this.storage.download(capsuleRoot, {
+      privateKey: recipientPrivKey,
+    });
+    const capsule = decodeCapsule(capsuleBytes);
+
+    // Verify signature
+    const { valid, reason } = verifyCapsule(capsule);
+    if (!valid) throw new Error(`MemoryCapsule invalid: ${reason}`);
+
+    // Unwrap the kvSymKey using ECDH
+    const kvSymKey = unwrapKey(
+      capsule.wrappedKvKey,
+      recipientPrivKey,
+      capsule.granterPubKey
+    );
+
+    return { capsule, kvSymKey };
+  }
+}
+
+function fallbackGrantId(from: string, to: string, scope: string): string {
+  return ethers.keccak256(ethers.toUtf8Bytes(`${from}:${to}:${scope}:${Date.now()}`));
 }

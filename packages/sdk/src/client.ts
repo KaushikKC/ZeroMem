@@ -16,21 +16,44 @@ import {
   forkBranch,
   mergeBranch,
   log as gitLog,
-  replay as gitReplay,
   blame as gitBlame,
+  diffBranches,
 } from './git.js';
+import {
+  deriveKvSymKey,
+  encryptKvText,
+  decryptKvText,
+  createAccessChallenge,
+  respondToChallenge,
+  verifyChallenge,
+  type AccessChallenge,
+  type AccessTier,
+} from './acl.js';
 import type {
   ZeroMemConfig,
   RecallResult,
   Plan,
   ZeroCommit,
-  DEFAULTS,
+  SearchOpts,
+  MemStats,
+  CommitProof,
+  DiffResult,
+  GcResult,
 } from './types.js';
 import { DEFAULTS as D } from './types.js';
+import {
+  ZeroMemFrozenError,
+  ZeroMemGrantNotFoundError,
+  ZeroMemGrantExpiredError,
+  ZeroMemNoTipError,
+} from './errors.js';
 
 export interface RememberOpts {
   ns?: string;
   tags?: string[];
+  /** Skip write if a memory with cosine similarity ≥ threshold already exists (default 0.95) */
+  dedupe?: boolean;
+  dedupeThreshold?: number;
 }
 
 export interface RecallOpts {
@@ -52,12 +75,15 @@ export class ZeroMem {
   readonly currentBranch: string;
   private readonly privateKey: string;
   private frozen = false;
+  /** Per-wallet AES-256-GCM key for encrypting text in KV shards */
+  private readonly kvSymKey: Buffer;
 
   private constructor(config: ZeroMemConfig & { _storage?: StorageClient; _branch?: string; _frozen?: boolean }) {
     this.privateKey = config.privateKey;
     this.agentId = config.agentId;
     this.currentBranch = config._branch ?? config.branch ?? 'main';
     this.frozen = config._frozen ?? false;
+    this.kvSymKey = deriveKvSymKey(config.privateKey);
 
     this.storage =
       config._storage ??
@@ -122,25 +148,34 @@ export class ZeroMem {
    *   text → embed → encrypt → 0G Log (commit) → KV vector index updated
    */
   async remember(text: string, opts: RememberOpts = {}): Promise<string> {
-    if (this.frozen) throw new Error('Cannot write to a frozen replay snapshot');
+    if (this.frozen) throw new ZeroMemFrozenError();
 
     const ns = opts.ns ?? 'default';
     const tags = opts.tags ?? [];
-    // Qualify the vector index namespace with the branch so branches are isolated
     const indexNs = `${this.currentBranch}/${ns}`;
+    const now = Date.now();
 
-    // 1. Generate embedding
+    // 1. Embed first — needed for both dedupe check and storage
     const embedding = await this.inference.embed(text);
 
-    // 2. Build and encrypt payload
-    const payload = { text, embedding, ts: Date.now(), tags };
+    // 2. Semantic deduplication — skip write if near-identical memory exists
+    if (opts.dedupe !== false) {
+      const threshold = opts.dedupeThreshold ?? 0.95;
+      const near = await this.vector.search(embedding, { k: 1, namespace: indexNs });
+      if (near.length > 0 && near[0].score >= threshold) {
+        return near[0].commitId; // return existing, no write
+      }
+    }
+
+    // 3. Build and encrypt payload
+    const payload = { text, embedding, ts: now, tags };
     const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
     const payloadRoot = await this.storage.upload(payloadBytes, {
       encrypt: true,
       recipientPubKey: this.storage.pubKey,
     });
 
-    // 3. Build commit
+    // 4. Build commit
     const parent = await this.kv.getHead(this.agentId, this.currentBranch);
     const partial = buildCommit({
       parent,
@@ -150,28 +185,30 @@ export class ZeroMem {
       branch: this.currentBranch,
       namespace: ns,
       payloadRoot,
-      metadata: {
-        ts: Date.now(),
-        embedding_dim: embedding.length,
-        tags,
-      },
+      metadata: { ts: now, embedding_dim: embedding.length, tags },
     });
     const commit = await signCommit(partial, this.wallet);
-
-    // 4. Store commit on 0G (encrypted to self)
     const commitId = await storeCommit(commit, this.storage);
 
-    // 5. Update KV: head pointer, root anchor (first commit only), vector index
-    await this.kv.setHead(this.agentId, this.currentBranch, commitId);
-    await this.kv.setRootCommitIfAbsent(this.agentId, this.currentBranch, commitId);
-    await this.vector.insert({
-      commitId,
-      text,
-      embedding,
-      ts: Date.now(),
-      tags,
-      namespace: indexNs,
-    });
+    // 5. Batch all KV writes into one on-chain transaction
+    const isFirstCommit = !(await this.kv.getRootCommit(this.agentId, this.currentBranch));
+    const itemCount = await this.kv.getItemCount(this.agentId, indexNs);
+    const shard = Math.floor(itemCount / 256);
+    const existingShard = await this.kv.getShard<import('./types.js').VectorEntry>(this.agentId, indexNs, shard);
+    // Encrypt text before writing to KV — embedding stays plaintext for search
+    const encryptedText = encryptKvText(text, this.kvSymKey);
+    const newEntry: import('./types.js').VectorEntry = { commitId, text: encryptedText, embedding, ts: now, tags, namespace: indexNs };
+    const updatedShard = [...existingShard, newEntry].slice(-256);
+
+    const pairs: Array<{ key: string; value: Uint8Array }> = [
+      { key: this.kv.headKey(this.agentId, this.currentBranch), value: new TextEncoder().encode(commitId) },
+      { key: this.kv.itemCountKey(this.agentId, indexNs), value: new TextEncoder().encode(String(itemCount + 1)) },
+      { key: this.kv.shardKey(this.agentId, indexNs, shard), value: new TextEncoder().encode(JSON.stringify(updatedShard)) },
+    ];
+    if (isFirstCommit) {
+      pairs.push({ key: this.kv.rootCommitKey(this.agentId, this.currentBranch), value: new TextEncoder().encode(commitId) });
+    }
+    await this.kv.batch(pairs);
 
     return commitId;
   }
@@ -189,7 +226,13 @@ export class ZeroMem {
 
     const indexNs = `${this.currentBranch}/${ns}`;
     const queryEmbedding = await this.inference.embed(query);
-    return this.vector.search(queryEmbedding, { k, namespace: indexNs });
+    const hits = await this.vector.search(queryEmbedding, { k, namespace: indexNs });
+    return this.decryptResults(hits, this.kvSymKey);
+  }
+
+  /** Decrypt encrypted text fields in recall results using the given AES key */
+  private decryptResults(hits: RecallResult[], symKey: Buffer): RecallResult[] {
+    return hits.map((h) => ({ ...h, text: decryptKvText(h.text, symKey) }));
   }
 
   private async recallFromGrant(
@@ -199,22 +242,45 @@ export class ZeroMem {
     k: number
   ): Promise<RecallResult[]> {
     const record = await this.grants.getGrantRecord(from, this.wallet.address, ns);
-    if (!record) throw new Error(`No grant found from ${from} for scope '${ns}'`);
+    if (!record) throw new ZeroMemGrantNotFoundError(from, ns);
     if (record.ttl < Math.floor(Date.now() / 1000)) {
-      throw new Error(`Grant from ${from} for scope '${ns}' has expired`);
+      throw new ZeroMemGrantExpiredError(from, ns);
     }
 
-    // granterAgentId is the string agentId used as KV key prefix (e.g. 'researcher-v1')
-    const granterAgentId = record.granterAgentId;
+    // Check that this namespace is allowed under the grant tier
+    const grantRecord = record as any;
+    if (grantRecord.tier) {
+      const { ACCESS_TIER_NAMESPACES } = await import('./acl.js');
+      const allowed = ACCESS_TIER_NAMESPACES[grantRecord.tier as AccessTier] ?? [];
+      if (!allowed.includes(ns)) {
+        throw new Error(`Access tier '${grantRecord.tier}' does not allow namespace '${ns}'`);
+      }
+    }
 
-    // KV vector index is publicly readable — create a view on the granter's stream
+    // Fetch the MemoryCapsule from 0G Storage to get the unwrapped kvSymKey
+    let grantorSymKey: Buffer = Buffer.alloc(32); // fallback: all-zeros (won't decrypt)
+    if (grantRecord.capsuleRoot) {
+      try {
+        const { capsule, kvSymKey } = await this.grants.getCapsule({
+          grantId: record.grantId,
+          granterAddress: from,
+          capsuleRoot: grantRecord.capsuleRoot,
+          recipientPrivKey: this.privateKey,
+        });
+        grantorSymKey = kvSymKey;
+      } catch {
+        // capsule unavailable — fall through with empty key (reads will fail gracefully)
+      }
+    }
+
+    const granterAgentId = record.granterAgentId;
     const grantorKv = new KvViews(this.storage, from);
     const grantorVector = new VectorIndex(grantorKv, granterAgentId);
-
-    // Use branch-qualified namespace: granter likely stored on their 'main' branch
     const indexNs = `main/${ns}`;
     const queryEmbedding = await this.inference.embed(query);
-    return grantorVector.search(queryEmbedding, { k, namespace: indexNs });
+    const hits = await grantorVector.search(queryEmbedding, { k, namespace: indexNs });
+    // Decrypt using the granter's KV sym key (unwrapped from capsule)
+    return this.decryptResults(hits, grantorSymKey);
   }
 
   // ── Git operations ─────────────────────────────────────────────────────────
@@ -247,6 +313,7 @@ export class ZeroMem {
       agentId: this.agentId,
       currentBranch: name,
       privateKey: this.privateKey,
+      kvSymKey: this.kvSymKey,
       frozen: false,
     });
     return child;
@@ -286,6 +353,7 @@ export class ZeroMem {
       agentId: this.agentId,
       currentBranch: `replay/${opts.at.slice(0, 8)}`,
       privateKey: this.privateKey,
+      kvSymKey: this.kvSymKey,
       frozen: true,
     });
     return snapshot;
@@ -331,21 +399,31 @@ export class ZeroMem {
    * Compact episodic → semantic: reads recent commits, runs sealed-inference
    * reflection, writes a 'reflect' commit with the semantic summary.
    */
-  async reflect(opts: { since?: string; tier?: string } = {}): Promise<string> {
-    const sinceMs = parseSince(opts.since ?? '24h');
-    const ns = 'default';
-
+  /**
+   * Compact episodic → semantic.
+   *
+   * Incremental: only processes commits written AFTER the last reflect().
+   * If reflect() has never run, falls back to the `since` window.
+   * Marks the timestamp in KV so the next call skips already-reflected commits.
+   */
+  async reflect(opts: { since?: string; tier?: string; force?: boolean } = {}): Promise<string> {
     const head = await this.kv.getHead(this.agentId, this.currentBranch);
     if (!head) return '';
 
+    // Incremental cutoff: use the later of (lastReflect timestamp) and (since window)
+    const lastReflectTs = await this.kv.getLastReflectTs(this.agentId, this.currentBranch);
+    const sinceWindowMs  = parseSince(opts.since ?? '24h');
+    // If we've reflected before and it's more recent than the since-window, use it.
+    // force:true skips this and re-processes the full since-window.
+    const cutoffMs = (!opts.force && lastReflectTs > sinceWindowMs)
+      ? lastReflectTs
+      : sinceWindowMs;
+
     const recentTexts: string[] = [];
-    for await (const { commit } of walkCommits(
-      head,
-      this.storage,
-      this.privateKey
-    )) {
+    for await (const { commit } of walkCommits(head, this.storage, this.privateKey)) {
       if (commit.op !== 'remember') continue;
-      if (commit.metadata.ts < sinceMs) break;
+      // Stop at commits older than our cutoff (DAG is newest-first)
+      if (commit.metadata.ts <= cutoffMs) break;
       try {
         const data = await this.storage.download(commit.payload_root, {
           privateKey: this.privateKey,
@@ -353,20 +431,25 @@ export class ZeroMem {
         const payload = JSON.parse(new TextDecoder().decode(data)) as { text?: string };
         if (payload.text) recentTexts.push(payload.text);
       } catch {
-        // skip
+        // skip unreadable payloads
       }
     }
 
     if (recentTexts.length === 0) return '';
 
+    const reflectStartTs = Date.now();
     const summary = await this.inference.reflect(recentTexts);
-    const summaryCommitId = await this.remember(summary, {
+
+    // Store the semantic summary as a remember commit so it's searchable
+    await this.remember(summary, {
       ns: 'semantic',
-      tags: ['reflect', `since:${opts.since ?? '24h'}`],
+      tags: ['reflect', `since:${new Date(cutoffMs).toISOString()}`],
     });
 
-    // Store reflect commit
-    const payloadBytes = new TextEncoder().encode(JSON.stringify({ summary, sourceCount: recentTexts.length }));
+    // Write the formal 'reflect' commit with metadata
+    const payloadBytes = new TextEncoder().encode(
+      JSON.stringify({ summary, sourceCount: recentTexts.length, cutoffMs })
+    );
     const payloadRoot = await this.storage.upload(payloadBytes, {
       encrypt: true,
       recipientPubKey: this.storage.pubKey,
@@ -380,11 +463,16 @@ export class ZeroMem {
       branch: this.currentBranch,
       namespace: 'semantic',
       payloadRoot,
-      metadata: { ts: Date.now(), tags: ['reflect'] },
+      metadata: { ts: reflectStartTs, tags: ['reflect'] },
     });
     const commit = await signCommit(partial, this.wallet);
     const commitId = await storeCommit(commit, this.storage);
-    await this.kv.setHead(this.agentId, this.currentBranch, commitId);
+
+    // Batch: update HEAD + persist last-reflect timestamp in one tx
+    await this.kv.batch([
+      { key: this.kv.headKey(this.agentId, this.currentBranch), value: new TextEncoder().encode(commitId) },
+      { key: this.kv.lastReflectKey(this.agentId, this.currentBranch), value: new TextEncoder().encode(String(reflectStartTs)) },
+    ]);
 
     return commitId;
   }
@@ -430,21 +518,31 @@ export class ZeroMem {
 
   // ── Grant / revoke ─────────────────────────────────────────────────────────
 
-  async grant(opts: { to: string; toPubKey?: string; scope: string; ttl: string; }): Promise<string> {
+  async grant(opts: {
+    to: string;
+    toPubKey?: string;
+    scope: string;
+    ttl: string;
+    /** READ_SEMANTIC | READ_FULL | ADMIN (default: READ_FULL) */
+    tier?: AccessTier;
+  }): Promise<string> {
     const head = await this.kv.getHead(this.agentId, this.currentBranch);
     if (!head) throw new Error('Nothing to grant — no commits yet');
 
-    const toPubKey = opts.toPubKey ?? opts.to; // fallback to address
+    const toPubKey = opts.toPubKey ?? opts.to;
 
     const grantId = await this.grants.createGrant({
       from: this.wallet.address,
       granterAgentId: this.agentId,
+      granterPubKey: this.storage.pubKey,
       to: opts.to,
       toPubKey,
       scope: opts.scope,
       ttl: opts.ttl,
+      tier: opts.tier ?? 'READ_FULL',
       headCommitId: head,
       privateKey: this.privateKey,
+      kvSymKey: this.kvSymKey,
     });
 
     // Write 'grant' commit
@@ -528,12 +626,7 @@ export class ZeroMem {
       (await this.kv.getHead(this.agentId, b)) ??
       (await this.kv.getRootCommit(this.agentId, b));
 
-    if (!tip) {
-      throw new Error(
-        `Cannot restore branch '${b}': no tip commit found in KV. ` +
-        `Pass the last known commitId: mem.restore('${b}', { tipCommitId: '0x...' })`
-      );
-    }
+    if (!tip) throw new ZeroMemNoTipError(b);
 
     // Walk from tip → root, collecting all commits in reverse-chronological order
     const allCommits: Array<{ commitId: string; commit: ZeroCommit }> = [];
@@ -587,6 +680,315 @@ export class ZeroMem {
     await this.kv.addBranch(this.agentId, b);
   }
 
+  // ── Feature: search() with rich filters ───────────────────────────────────
+
+  /**
+   * Richer version of recall() — supports tag filters, time windows,
+   * minimum score threshold, and recency weighting.
+   */
+  async search(opts: SearchOpts): Promise<RecallResult[]> {
+    const { query, k = 5, ns = 'default', from, ...filterOpts } = opts;
+
+    if (from) {
+      return this.recallFromGrant(query, from, ns, k);
+    }
+
+    const indexNs = `${this.currentBranch}/${ns}`;
+    const queryEmbedding = await this.inference.embed(query);
+    const hits = await this.vector.search(queryEmbedding, {
+      k,
+      namespace: indexNs,
+      ...filterOpts,
+    });
+    return this.decryptResults(hits, this.kvSymKey);
+  }
+
+  // ── Feature: stats() ───────────────────────────────────────────────────────
+
+  /** Return a snapshot of this agent's memory usage from KV metadata (no blob downloads) */
+  async stats(): Promise<MemStats> {
+    const branches = await this.kv.getBranches(this.agentId);
+    const skills = await this.kv.getSkillManifest(this.agentId);
+    const headCommitId = await this.kv.getHead(this.agentId, this.currentBranch);
+
+    const namespaceStats: Record<string, number> = {};
+    const knownNs = ['default', 'semantic', 'sessions', 'plans'];
+
+    for (const branch of branches) {
+      for (const ns of knownNs) {
+        const key = `${branch}/${ns}`;
+        const count = await this.kv.getItemCount(this.agentId, key);
+        if (count > 0) namespaceStats[key] = count;
+      }
+    }
+
+    const approxTotalMemories = Object.values(namespaceStats).reduce((a, b) => a + b, 0);
+
+    return {
+      agentId: this.agentId,
+      currentBranch: this.currentBranch,
+      branches,
+      namespaceStats,
+      skills,
+      headCommitId,
+      approxTotalMemories,
+    };
+  }
+
+  // ── Feature: gc() — garbage collect tombstoned entries ────────────────────
+
+  /**
+   * Remove tombstoned entries from all vector index shards.
+   * Reduces KV storage and speeds up search queries.
+   */
+  async gc(opts: { ns?: string } = {}): Promise<GcResult> {
+    const tombList = await this.kv.getTombList(this.agentId);
+    if (tombList.length === 0) return { removed: 0, namespacesScanned: [] };
+
+    const tombSet = new Set(tombList);
+    const branches = await this.kv.getBranches(this.agentId);
+    const knownNs = opts.ns
+      ? [opts.ns]
+      : ['default', 'semantic', 'sessions', 'plans'];
+
+    let totalRemoved = 0;
+    const scanned: string[] = [];
+
+    for (const branch of branches) {
+      for (const ns of knownNs) {
+        const indexNs = `${branch}/${ns}`;
+        const count = await this.kv.getItemCount(this.agentId, indexNs);
+        if (count === 0) continue;
+        scanned.push(indexNs);
+        const removed = await this.vector.gc(indexNs, tombSet);
+        totalRemoved += removed;
+      }
+    }
+
+    return { removed: totalRemoved, namespacesScanned: scanned };
+  }
+
+  // ── Feature: prove() — Merkle attestation ─────────────────────────────────
+
+  /**
+   * Generate a verifiable proof that a specific commit exists on 0G Storage.
+   * The proof includes:
+   *   - The commit's own secp256k1 signature (written at store time)
+   *   - A fresh attestation signature over { commitId, provedAt } (written now)
+   *   - A link to the 0G Storage Explorer for independent verification
+   */
+  async prove(commitId: string): Promise<CommitProof> {
+    const commit = await loadCommit(commitId, this.storage, this.privateKey);
+
+    // Fresh attestation: sign { commitId, provedAt } with current wallet
+    const provedAt = Date.now();
+    const attestationMsg = JSON.stringify({ commitId, provedAt });
+    const attestationHash = ethers.keccak256(ethers.toUtf8Bytes(attestationMsg));
+    const attestationSig = await this.wallet.signMessage(ethers.getBytes(attestationHash));
+
+    return {
+      commitId,
+      agentId: this.agentId,
+      agentAddress: this.wallet.address,
+      agentPubKey: this.storage.pubKey,
+      op: commit.op,
+      branch: commit.branch,
+      payloadRoot: commit.payload_root,
+      ts: commit.metadata.ts,
+      commitSig: commit.sig,
+      attestationSig,
+      provedAt,
+      storageExplorerUrl: `https://storagescan-galileo.0g.ai/tx/${commitId}`,
+    };
+  }
+
+  // ── Feature: diff() — compare two branches ────────────────────────────────
+
+  /** Show commits in one branch that don't exist in another */
+  async diff(branchA: string, branchB: string): Promise<DiffResult> {
+    return diffBranches(
+      {
+        storage: this.storage,
+        kv: this.kv,
+        vector: this.vector,
+        wallet: this.wallet,
+        agentId: this.agentId,
+        branch: this.currentBranch,
+        privateKey: this.privateKey,
+      },
+      branchA,
+      branchB
+    );
+  }
+
+  // ── Feature: snapshot() / checkout() — named checkpoints ──────────────────
+
+  /** Tag the current HEAD as a named snapshot (like a Git tag) */
+  async snapshot(name: string): Promise<void> {
+    const head = await this.kv.getHead(this.agentId, this.currentBranch);
+    if (!head) throw new Error(`Cannot snapshot — no commits on branch '${this.currentBranch}'`);
+    await this.kv.setSnapshot(this.agentId, name, head);
+  }
+
+  /** Return a frozen read-only ZeroMem at a named snapshot */
+  async checkout(name: string): Promise<ZeroMem> {
+    const commitId = await this.kv.getSnapshot(this.agentId, name);
+    if (!commitId) throw new Error(`Snapshot '${name}' not found`);
+    return this.replay({ at: commitId });
+  }
+
+  // ── Feature: runPlan() — execute a stored plan ────────────────────────────
+
+  /** Load a plan by its commitId and return tasks in dependency order */
+  async getPlan(planCommitId: string): Promise<Plan> {
+    const data = await this.storage.download(
+      (await loadCommit(planCommitId, this.storage, this.privateKey)).payload_root,
+      { privateKey: this.privateKey }
+    );
+    const raw = JSON.parse(new TextDecoder().decode(data)) as { goal: string; tasks: PlanTask[] };
+    return { goal: raw.goal, commitId: planCommitId, tasks: raw.tasks ?? [] };
+  }
+
+  /** Mark a plan task as done and write an updated plan commit */
+  async completePlanTask(planCommitId: string, taskId: string): Promise<string> {
+    const plan = await this.getPlan(planCommitId);
+    const tasks = plan.tasks.map((t) =>
+      t.id === taskId ? { ...t, done: true } : t
+    );
+
+    const data = new TextEncoder().encode(JSON.stringify({ goal: plan.goal, tasks }));
+    const payloadRoot = await this.storage.upload(data, {
+      encrypt: true,
+      recipientPubKey: this.storage.pubKey,
+    });
+    const parent = await this.kv.getHead(this.agentId, this.currentBranch);
+    const partial = buildCommit({
+      parent,
+      agentId: this.agentId,
+      authorPubkey: this.storage.pubKey,
+      op: 'reflect',
+      branch: this.currentBranch,
+      namespace: 'plans',
+      payloadRoot,
+      metadata: { ts: Date.now(), tags: ['plan', `done:${taskId}`] },
+    });
+    const commit = await signCommit(partial, this.wallet);
+    const newCommitId = await storeCommit(commit, this.storage);
+    await this.kv.setHead(this.agentId, this.currentBranch, newCommitId);
+    return newCommitId;
+  }
+
+  // ── Feature: forgetBulk() — bulk tombstone ─────────────────────────────────
+
+  /**
+   * Tombstone all memories matching the given criteria.
+   * Run gc() afterwards to reclaim KV storage.
+   */
+  async forgetBulk(opts: {
+    tags?: string[];
+    olderThan?: string;
+    ns?: string;
+  }): Promise<number> {
+    const ns = opts.ns ?? 'default';
+    const indexNs = `${this.currentBranch}/${ns}`;
+    const untilMs = opts.olderThan ? parseSince(opts.olderThan) : 0;
+
+    const itemCount = await this.kv.getItemCount(this.agentId, indexNs);
+    const totalShards = Math.max(1, Math.ceil(itemCount / 256) + 1);
+    const shards = await Promise.all(
+      Array.from({ length: totalShards }, (_, s) =>
+        this.kv.getShard<import('./types.js').VectorEntry>(this.agentId, indexNs, s)
+      )
+    );
+
+    let count = 0;
+    for (const entries of shards) {
+      for (const e of entries) {
+        const matchesTags =
+          !opts.tags || opts.tags.every((t) => e.tags.includes(t));
+        const matchesTime =
+          untilMs === 0 || e.ts < untilMs;
+        if (matchesTags && matchesTime) {
+          await this.forget(e.commitId);
+          count++;
+        }
+      }
+    }
+    return count;
+  }
+
+  // ── Agent-to-Agent Access Control ─────────────────────────────────────────
+
+  /**
+   * Step 1 — Granter creates a challenge nonce.
+   * Send this to the recipient off-chain (e.g. API call, QR code, message).
+   */
+  async createAccessChallenge(recipientAddress: string, scope: string): Promise<AccessChallenge> {
+    return createAccessChallenge(this.privateKey, recipientAddress, scope);
+  }
+
+  /**
+   * Step 2 — Recipient signs the challenge to prove wallet ownership.
+   * The proof is sent back to the granter.
+   */
+  static async signAccessChallenge(
+    recipientPrivKey: string,
+    challenge: AccessChallenge
+  ): Promise<string> {
+    return respondToChallenge(recipientPrivKey, challenge);
+  }
+
+  /**
+   * Step 3 — Granter verifies the proof and creates the grant.
+   * Only creates the grant if the recipient signed the correct nonce.
+   * Prevents accidental grants to wrong/stolen addresses.
+   */
+  async grantVerified(opts: {
+    challenge: AccessChallenge;
+    proof: string;
+    toPubKey: string;
+    ttl: string;
+    tier?: AccessTier;
+  }): Promise<string> {
+    const { challenge, proof, ...grantOpts } = opts;
+    const { valid, reason } = verifyChallenge(challenge, proof);
+    if (!valid) throw new Error(`Access challenge failed: ${reason}`);
+    return this.grant({
+      to: challenge.recipientAddress,
+      toPubKey: grantOpts.toPubKey,
+      scope: challenge.scope,
+      ttl: grantOpts.ttl,
+      tier: grantOpts.tier,
+    });
+  }
+
+  /**
+   * Grant the same scope to multiple wallets at once.
+   * Each recipient gets their own MemoryCapsule (their own ECDH-wrapped key).
+   */
+  async batchGrant(opts: {
+    recipients: Array<{ address: string; pubKey: string }>;
+    scope: string;
+    ttl: string;
+    tier?: AccessTier;
+  }): Promise<string[]> {
+    const head = await this.kv.getHead(this.agentId, this.currentBranch);
+    if (!head) throw new Error('Nothing to grant — no commits yet');
+
+    return this.grants.batchGrant({
+      from: this.wallet.address,
+      granterAgentId: this.agentId,
+      granterPubKey: this.storage.pubKey,
+      recipients: opts.recipients,
+      scope: opts.scope,
+      ttl: opts.ttl,
+      tier: opts.tier ?? 'READ_FULL',
+      headCommitId: head,
+      privateKey: this.privateKey,
+      kvSymKey: this.kvSymKey,
+    });
+  }
+
   // ── Escape hatch ───────────────────────────────────────────────────────────
 
   get raw() {
@@ -601,6 +1003,9 @@ export class ZeroMem {
     };
   }
 }
+
+// Also export PlanTask type for getPlan/completePlanTask
+type PlanTask = import('./types.js').PlanTask;
 
 function parseSince(since: string): number {
   const now = Date.now();

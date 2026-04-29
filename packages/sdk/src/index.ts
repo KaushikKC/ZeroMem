@@ -15,16 +15,48 @@ export {
   loadCommit,
   walkCommits,
 } from './commit.js';
+export { diffBranches } from './git.js';
+export {
+  deriveKvSymKey,
+  encryptKvText,
+  decryptKvText,
+  wrapKeyForRecipient,
+  unwrapKey,
+  createCapsule,
+  verifyCapsule,
+  encodeCapsule,
+  decodeCapsule,
+  createAccessChallenge,
+  respondToChallenge,
+  verifyChallenge,
+  ACCESS_TIER_NAMESPACES,
+  type MemoryCapsule,
+  type AccessChallenge,
+  type AccessTier,
+} from './acl.js';
+export {
+  ZeroMemFrozenError,
+  ZeroMemGrantNotFoundError,
+  ZeroMemGrantExpiredError,
+  ZeroMemStorageError,
+  ZeroMemNoTipError,
+  ZeroMemDuplicateSkippedError,
+} from './errors.js';
 export type {
   ZeroCommit,
   CommitOp,
   CommitMetadata,
   VectorEntry,
   RecallResult,
+  SearchOpts,
   GrantRecord,
   Skill,
   Plan,
   PlanTask,
   ZeroMemConfig,
+  MemStats,
+  CommitProof,
+  DiffResult,
+  GcResult,
 } from './types.js';
 export { DEFAULTS } from './types.js';

@@ -3,11 +3,13 @@
   "private": true,
   "workspaces": [
     "packages/*",
-    "examples/*"
+    "examples/*",
+    "relayer"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
+    "test:all": "cd packages/sdk && npx jest --no-coverage && cd ../openclaw-zeromem && npx jest --no-coverage",
     "compile": "npm run compile --workspaces --if-present"
   },
   "dependencies": {

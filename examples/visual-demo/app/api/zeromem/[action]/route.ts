@@ -3,11 +3,29 @@ import { ZeroMem } from '@zeromem/sdk';
 
 const instances = new Map<string, ZeroMem>();
 
+/**
+ * Pick the right private key for an agentId.
+ * researcher-* → RESEARCHER_PRIVATE_KEY
+ * writer-*     → WRITER_PRIVATE_KEY
+ * everything else → ZG_PRIVATE_KEY
+ */
+function keyForAgent(agentId: string): string {
+  const id = agentId.toLowerCase();
+  if (id.includes('researcher') || id.includes('agent-a') || id === 'main') {
+    return process.env.RESEARCHER_PRIVATE_KEY || process.env.ZG_PRIVATE_KEY!;
+  }
+  if (id.includes('writer') || id.includes('writer-a') || id.includes('writer-v')) {
+    return process.env.WRITER_PRIVATE_KEY || process.env.ZG_PRIVATE_KEY!;
+  }
+  return process.env.ZG_PRIVATE_KEY!;
+}
+
 async function getInstance(agentId: string, branch = 'main'): Promise<ZeroMem> {
+  const privateKey = keyForAgent(agentId);
   const key = `${agentId}::${branch}`;
   if (instances.has(key)) return instances.get(key)!;
   const mem = await ZeroMem.create({
-    privateKey: process.env.ZG_PRIVATE_KEY!,
+    privateKey,
     agentId,
     branch,
     rpcUrl: process.env.ZG_RPC,
@@ -21,8 +39,15 @@ async function getInstance(agentId: string, branch = 'main'): Promise<ZeroMem> {
   return mem;
 }
 
-function ok(data: unknown) { return NextResponse.json(data); }
+function ok(data: unknown, warn?: string) {
+  return NextResponse.json(warn ? { ...data as object, _warn: warn } : data);
+}
 function err(msg: string, status = 500) { return NextResponse.json({ error: msg }, { status }); }
+
+/** Returns true if the storage client is using the in-memory KV fallback */
+function kvFallbackActive(mem: ZeroMem): boolean {
+  return (mem.raw.storage as any).kvNodeDown === true;
+}
 
 export async function POST(
   request: NextRequest,
@@ -38,13 +63,36 @@ export async function POST(
 
       // ── Memory ──────────────────────────────────────────────────────────────
 
+      case 'address': {
+        // Returns the wallet address for the current agentId — shown in UI so user
+        // knows which address to use as the granter in cross-agent recall
+        const { ethers } = await import('ethers');
+        const privKey = keyForAgent(agentId);
+        const address = new ethers.Wallet(privKey).address;
+        const pubKey = ethers.SigningKey.computePublicKey(
+          new ethers.Wallet(privKey).signingKey.publicKey, true
+        );
+        return ok({ agentId, address, pubKey });
+      }
+
+      case 'health': {
+        const kv = kvFallbackActive(mem);
+        return ok({
+          rpc: process.env.ZG_RPC,
+          kvMode: kv ? 'in-memory (KV node unreachable — session only)' : 'on-chain',
+          kvNodeDown: kv,
+          grantRegistry: process.env.GRANT_REGISTRY_ADDRESS,
+        });
+      }
+
       case 'remember': {
         const commitId = await mem.remember(body.text, {
           ns: body.ns,
           tags: body.tags,
           dedupe: body.dedupe ?? false,
         });
-        return ok({ commitId });
+        const warn = kvFallbackActive(mem) ? 'KV node unreachable — data stored in-memory this session only. Blobs are on 0G.' : undefined;
+        return ok({ commitId }, warn);
       }
 
       case 'recall': {
@@ -287,6 +335,15 @@ export async function POST(
         return err(`Unknown action: ${params.action}`, 404);
     }
   } catch (e: any) {
-    return err(e.message ?? 'Internal error');
+    // Extract a meaningful message from any error type
+    const message =
+      e?.message ||                          // standard Error
+      e?.cause?.message ||                   // wrapped cause
+      e?.code ||                             // network error code
+      (typeof e === 'string' ? e : null) ||  // thrown string
+      JSON.stringify(e) ||                   // object
+      'Internal server error';
+    console.error(`[zeromem/${params.action}]`, e);
+    return err(message);
   }
 }

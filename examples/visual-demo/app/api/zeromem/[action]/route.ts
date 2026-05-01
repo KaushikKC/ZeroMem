@@ -214,11 +214,17 @@ export async function POST(
       }
 
       case 'signChallenge': {
-        const proof = await ZeroMem.signAccessChallenge(
-          process.env.ZG_PRIVATE_KEY!,
-          body.challenge
-        );
-        return ok({ proof });
+        // In production the recipient signs client-side with their own wallet.
+        // For demo: accept an explicit recipientPrivKey; fall back to server key.
+        const recipientKey: string = body.recipientPrivKey || process.env.ZG_PRIVATE_KEY!;
+        if (!recipientKey || recipientKey.length < 60) {
+          return err('recipientPrivKey is required for signChallenge (paste WRITER_PRIVATE_KEY or RESEARCHER_PRIVATE_KEY)');
+        }
+        const proof = await ZeroMem.signAccessChallenge(recipientKey, body.challenge);
+        // Derive the address that signed so the UI can confirm
+        const { ethers } = await import('ethers');
+        const signerAddress = new ethers.Wallet(recipientKey).address;
+        return ok({ proof, signerAddress });
       }
 
       case 'grantVerified': {

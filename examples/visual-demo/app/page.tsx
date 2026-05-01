@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -109,6 +109,9 @@ export default function Home() {
   const [branch, setBranch] = useState('main');
   const [loading, setLoading] = useState(false);
   const [activityLog, setActivityLog] = useState<LogEntry[]>([]);
+  const [kvMode, setKvMode] = useState<'unknown' | 'on-chain' | 'in-memory'>('unknown');
+  const [walletAddr, setWalletAddr] = useState('');
+  const [walletPubKey, setWalletPubKey] = useState('');
 
   // Memory state
   const [memText, setMemText] = useState('');
@@ -117,7 +120,9 @@ export default function Home() {
   const [query, setQuery] = useState('');
   const [question, setQuestion] = useState('');
   const [searchOpts, setSearchOpts] = useState({ since: '', minScore: '', tags: '' });
-  const [hits, setHits] = useState<Hit[]>([]);
+  const [recallHits, setRecallHits] = useState<Hit[]>([]);
+  const [askHits, setAskHits] = useState<Hit[]>([]);
+  const [searchHits, setSearchHits] = useState<Hit[]>([]);
   const [answer, setAnswer] = useState('');
   const [forgetId, setForgetId] = useState('');
 
@@ -194,12 +199,33 @@ return { summary: lines.slice(0, 3).join(' | ') };`);
       });
       const data = await res.json();
       if (data.error) { log(action, data, false); throw new Error(data.error); }
+      // Track KV mode from server responses
+      if (data._warn?.includes('KV node')) setKvMode('in-memory');
+      else if (action === 'health') setKvMode(data.kvNodeDown ? 'in-memory' : 'on-chain');
       log(action, data, true);
       return data;
     } finally {
       setLoading(false);
     }
   }, [agentId, branch, log]);
+
+  // Check health + wallet on first load / agent change
+  const checkHealth = useCallback(async () => {
+    try {
+      const [hRes, aRes] = await Promise.all([
+        fetch('/api/zeromem/health', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentId, branch }) }),
+        fetch('/api/zeromem/address', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentId, branch }) }),
+      ]);
+      const h = await hRes.json();
+      const a = await aRes.json();
+      setKvMode(h.kvNodeDown ? 'in-memory' : 'on-chain');
+      setWalletAddr(a.address ?? '');
+      setWalletPubKey(a.pubKey ?? '');
+    } catch {}
+  }, [agentId, branch]);
+
+  // Auto-check health on load and when agentId changes
+  useEffect(() => { checkHealth(); }, [agentId]); // eslint-disable-line
 
   const refreshLog = useCallback(async () => {
     const data = await call('log', { limit: 15 });
@@ -232,22 +258,25 @@ return { summary: lines.slice(0, 3).join(' | ') };`);
 
       <Card title="mem.recall() — Semantic search">
         <div className="flex gap-2">
-          <Input value={query} onChange={setQuery} placeholder="Search query…" />
+          <Input value={query} onChange={v => { setQuery(v); setRecallHits([]); }} placeholder="Search query…" />
           <Btn color="blue" onClick={async () => {
             const d = await call('recall', { query, k: 5, ns: memNs || undefined });
-            setHits(d.hits ?? []);
+            setRecallHits(d.hits ?? []);
           }} disabled={loading || !query.trim()}>recall()</Btn>
         </div>
-        {hits.map((h, i) => <HitCard key={i} hit={h} />)}
+        {recallHits.length > 0 && (
+          <p className="text-xs text-gray-600">{recallHits.length} result{recallHits.length !== 1 ? 's' : ''}</p>
+        )}
+        {recallHits.map((h, i) => <HitCard key={i} hit={h} />)}
       </Card>
 
       <Card title="mem.ask() — RAG answer from memories">
         <div className="flex gap-2">
-          <Input value={question} onChange={setQuestion} placeholder="Ask a question…" />
+          <Input value={question} onChange={v => { setQuestion(v); setAskHits([]); setAnswer(''); }} placeholder="Ask a question…" />
           <Btn color="purple" onClick={async () => {
             const d = await call('ask', { question, k: 5 });
             setAnswer(d.answer ?? '');
-            setHits(d.hits ?? []);
+            setAskHits(d.hits ?? []);
           }} disabled={loading || !question.trim()}>ask()</Btn>
         </div>
         {answer && (
@@ -256,11 +285,14 @@ return { summary: lines.slice(0, 3).join(' | ') };`);
             <p className="text-sm text-gray-100">{answer}</p>
           </div>
         )}
-        {hits.map((h, i) => <HitCard key={i} hit={h} />)}
+        {askHits.length > 0 && <p className="text-xs text-gray-600">Context memories used:</p>}
+        {askHits.map((h, i) => <HitCard key={i} hit={h} />)}
       </Card>
 
       <Card title="mem.search() — Search with filters">
-        <Input value={query} onChange={setQuery} placeholder="Query…" />
+        <div className="flex gap-2">
+          <Input value={query} onChange={v => { setQuery(v); setSearchHits([]); }} placeholder="Query…" />
+        </div>
         <div className="grid grid-cols-3 gap-2">
           <Input value={searchOpts.since} onChange={v => setSearchOpts(s => ({ ...s, since: v }))} placeholder="since: 7d / 1h" />
           <Input value={searchOpts.minScore} onChange={v => setSearchOpts(s => ({ ...s, minScore: v }))} placeholder="minScore: 0.4" />
@@ -273,9 +305,12 @@ return { summary: lines.slice(0, 3).join(' | ') };`);
             minScore: searchOpts.minScore || undefined,
             tags: searchOpts.tags ? searchOpts.tags.split(',').map(s => s.trim()) : undefined,
           });
-          setHits(d.hits ?? []);
+          setSearchHits(d.hits ?? []);
         }} disabled={loading || !query.trim()}>mem.search()</Btn>
-        {hits.map((h, i) => <HitCard key={i} hit={h} />)}
+        {searchHits.length > 0 && (
+          <p className="text-xs text-gray-600">{searchHits.length} result{searchHits.length !== 1 ? 's' : ''}</p>
+        )}
+        {searchHits.map((h, i) => <HitCard key={i} hit={h} />)}
       </Card>
 
       <Card title="mem.forget() — Tombstone a single commit">
@@ -826,8 +861,28 @@ return { summary: lines.slice(0, 3).join(' | ') };`);
             className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-yellow-300 outline-none w-28 font-mono"
           />
         </div>
-        <div className="ml-auto flex items-center gap-2 text-xs">
+        <div className="ml-auto flex items-center gap-3 text-xs">
           {loading && <span className="text-yellow-400 animate-pulse">● working…</span>}
+          {walletAddr && (
+            <span
+              className="text-gray-400 font-mono cursor-pointer hover:text-green-400"
+              title={`Wallet: ${walletAddr}\nPubKey: ${walletPubKey}\nClick to copy address`}
+              onClick={() => navigator.clipboard?.writeText(walletAddr)}
+            >
+              {walletAddr.slice(0, 6)}…{walletAddr.slice(-4)}
+            </span>
+          )}
+          {kvMode === 'in-memory' && (
+            <span className="bg-yellow-900 text-yellow-300 px-2 py-0.5 rounded font-bold" title="KV node unreachable — data lives in-memory this session. Blobs are on 0G.">
+              ⚠ KV: in-memory
+            </span>
+          )}
+          {kvMode === 'on-chain' && (
+            <span className="bg-green-900 text-green-300 px-2 py-0.5 rounded font-bold">
+              ✓ KV: on-chain
+            </span>
+          )}
+          <button onClick={checkHealth} className="text-gray-600 hover:text-gray-400" title="Refresh status">⟳</button>
           <span className="text-gray-700">GrantRegistry: 0xAa14…57ec</span>
         </div>
       </header>

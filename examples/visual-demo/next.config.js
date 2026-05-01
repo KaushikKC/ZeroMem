@@ -5,7 +5,10 @@ const nextConfig = {
     serverComponentsExternalPackages: [
       '@0gfoundation/0g-ts-sdk',
       '@0glabs/0g-serving-broker',
+      '@xenova/transformers',
+      '@zeromem/sdk',
       'ethers',
+      'pg',
     ],
   },
   webpack: (config, { isServer }) => {

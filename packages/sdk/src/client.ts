@@ -140,15 +140,15 @@ export class ZeroMem {
     config: ZeroMemConfig & { _storage?: StorageClient }
   ): Promise<ZeroMem> {
     const instance = new ZeroMem(config);
-    await instance.vector.init?.();
-    await instance.kv.addBranch(instance.agentId, instance.currentBranch);
-    // Best-effort on-chain setup (no-op if no contract configured)
+    // Init vector backend (e.g. Postgres creates tables)
+    try { await instance.vector.init?.(); } catch { /* optional */ }
+    // Track branch in KV — best-effort (in-memory fallback if KV node is down)
+    try { await instance.kv.addBranch(instance.agentId, instance.currentBranch); } catch { /* ok */ }
+    // On-chain setup — best-effort (no-op if no contract configured)
     try {
       await instance.grants.registerAgent(instance.storage.pubKey);
       await instance.grants.initEventListeners();
-    } catch {
-      // ok — no contract deployed yet
-    }
+    } catch { /* ok — no contract deployed yet */ }
     return instance;
   }
 

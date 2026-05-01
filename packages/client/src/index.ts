@@ -2,6 +2,9 @@ export interface ZeroMemClientConfig {
   agentId: string;
   serverUrl?: string;
   namespace?: string;
+  branch?: string;
+  /** Request timeout in ms (default 180_000 — chain writes need ~30–90s) */
+  timeoutMs?: number;
 }
 
 export interface RememberResponse {
@@ -40,6 +43,45 @@ export interface PlanResponse {
   };
 }
 
+export interface BranchResponse {
+  branch: string;
+}
+
+export interface LogEntry {
+  commitId: string;
+  commit: {
+    op: string;
+    branch: string;
+    namespace: string;
+    metadata: {
+      ts: number;
+      tags?: string[];
+    };
+  };
+}
+
+export interface LogResponse {
+  entries: LogEntry[];
+}
+
+export interface BlameEntry {
+  commitId: string;
+  ts: number;
+  op: string;
+}
+
+export interface BlameResponse {
+  matches: BlameEntry[];
+}
+
+export interface MergeResponse {
+  ok: boolean;
+}
+
+export interface RestoreResponse {
+  ok: boolean;
+}
+
 export interface HealthResponse {
   status: string;
   ts: number;
@@ -57,11 +99,16 @@ export class ZeroMemClient {
   private readonly agentId: string;
   private readonly serverUrl: string;
   private readonly namespace?: string;
+  readonly branch: string;
+  /** ms — write ops hit the chain so need generous headroom */
+  private readonly timeoutMs: number;
 
   private constructor(config: ZeroMemClientConfig) {
     this.agentId = config.agentId;
     this.serverUrl = (config.serverUrl ?? 'http://localhost:3001').replace(/\/$/, '');
     this.namespace = config.namespace;
+    this.branch = config.branch ?? 'main';
+    this.timeoutMs = config.timeoutMs ?? 180_000;
   }
 
   static create(config: ZeroMemClientConfig): ZeroMemClient {
@@ -74,6 +121,7 @@ export class ZeroMemClient {
   ): Promise<RememberResponse> {
     return this.post('/remember', {
       agentId: this.agentId,
+      branch: this.branch,
       text,
       ns: opts.ns ?? this.namespace,
       tags: opts.tags,
@@ -86,6 +134,7 @@ export class ZeroMemClient {
   ): Promise<RecallResponse> {
     return this.post('/recall', {
       agentId: this.agentId,
+      branch: this.branch,
       query,
       k: opts.k ?? 5,
       ns: opts.ns ?? this.namespace,
@@ -99,6 +148,7 @@ export class ZeroMemClient {
   ): Promise<AskResponse> {
     return this.post('/ask', {
       agentId: this.agentId,
+      branch: this.branch,
       question,
       k: opts.k ?? 5,
       ns: opts.ns ?? this.namespace,
@@ -109,7 +159,59 @@ export class ZeroMemClient {
   async plan(goal: string): Promise<PlanResponse> {
     return this.post('/plan', {
       agentId: this.agentId,
+      branch: this.branch,
       goal,
+    });
+  }
+
+  async branchOff(name: string): Promise<ZeroMemClient> {
+    await this.post<BranchResponse>('/branch', {
+      agentId: this.agentId,
+      branch: this.branch,
+      name,
+    });
+    return ZeroMemClient.create({
+      agentId: this.agentId,
+      serverUrl: this.serverUrl,
+      namespace: this.namespace,
+      branch: name,
+      timeoutMs: this.timeoutMs,
+    });
+  }
+
+  async merge(
+    sourceBranch: string,
+    opts: { strategy?: 'reflect' | 'fast-forward' } = {}
+  ): Promise<MergeResponse> {
+    return this.post('/merge', {
+      agentId: this.agentId,
+      branch: this.branch,
+      sourceBranch,
+      strategy: opts.strategy ?? 'fast-forward',
+    });
+  }
+
+  async log(opts: { limit?: number; branch?: string } = {}): Promise<LogResponse> {
+    return this.post('/log', {
+      agentId: this.agentId,
+      branch: opts.branch ?? this.branch,
+      limit: opts.limit ?? 20,
+    });
+  }
+
+  async blame(keyword: string, opts: { branch?: string } = {}): Promise<BlameResponse> {
+    return this.post('/blame', {
+      agentId: this.agentId,
+      branch: opts.branch ?? this.branch,
+      keyword,
+    });
+  }
+
+  async restore(opts: { branch?: string; tipCommitId?: string } = {}): Promise<RestoreResponse> {
+    return this.post('/restore', {
+      agentId: this.agentId,
+      branch: opts.branch ?? this.branch,
+      tipCommitId: opts.tipCommitId,
     });
   }
 
@@ -121,6 +223,7 @@ export class ZeroMemClient {
   }): Promise<GrantResponse> {
     return this.post('/grant', {
       agentId: this.agentId,
+      branch: this.branch,
       ...opts,
     });
   }
@@ -128,6 +231,7 @@ export class ZeroMemClient {
   async revoke(grantId: string): Promise<RevokeResponse> {
     return this.post('/revoke', {
       agentId: this.agentId,
+      branch: this.branch,
       grantId,
     });
   }
@@ -141,10 +245,18 @@ export class ZeroMemClient {
   }
 
   private async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
+    // undici (Node fetch) has a 30s headersTimeout independent of AbortSignal — chain
+    // writes can take 60–120s before the server writes the first response byte.
+    const { Agent } = await import('undici');
+    const dispatcher = new Agent({ headersTimeout: this.timeoutMs, bodyTimeout: this.timeoutMs });
+
     const resp = await fetch(`${this.serverUrl}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeoutMs),
+      // @ts-expect-error undici dispatcher
+      dispatcher,
     });
     if (!resp.ok) {
       throw new Error(`ZeroMem request failed: ${resp.status} ${await resp.text()}`);

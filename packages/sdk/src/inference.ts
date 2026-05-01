@@ -99,7 +99,8 @@ export class InferenceClient {
 
     // Fallback: lightweight local embedding via @xenova/transformers if available
     try {
-      const { pipeline } = await import('@xenova/transformers' as any);
+      // webpackIgnore tells Next.js bundler to skip this optional dep
+      const { pipeline } = await import(/* webpackIgnore: true */ '@xenova/transformers' as any);
       const extractor = await pipeline(
         'feature-extraction',
         'Xenova/all-MiniLM-L6-v2'

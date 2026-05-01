@@ -43,9 +43,21 @@ export class StorageClient {
   private privateKey: string;
   private rpcUrl: string;
   private flowContract: string;
-  /** Write-through cache: zgs_kv replay lags chain by minutes; cache lets
-   *  same-process reads see writes immediately. Survives restart only via Log replay. */
+  /**
+   * Write-through cache: zgs_kv replay lags chain by minutes; cache lets
+   * same-process reads see writes immediately. Survives restart only via Log replay.
+   * Also serves as the in-memory fallback when the KV node is unreachable.
+   */
   private kvCache = new Map<string, Uint8Array>();
+  /** Flipped to true on first KV network failure — avoids retrying a down node */
+  private kvNodeDown = false;
+
+  /**
+   * Process-level shared KV fallback — used when the real KV node is down.
+   * Shared across ALL StorageClient instances so cross-agent reads work
+   * even when each agent has its own instance (e.g. writer-a reading agent-a's grants).
+   */
+  private static sharedKv = new Map<string, Uint8Array>();
 
   constructor(
     privateKey: string,
@@ -213,26 +225,81 @@ export class StorageClient {
     return (header as any)?.version ?? null;
   }
 
-  /** KV read — returns null if key missing */
+  /** KV read — returns null if key missing.
+   *  Falls back to sharedKv (process-level) if the KV node is unreachable,
+   *  enabling cross-agent reads even with no live KV node. */
   async kvGet(streamId: string, key: string): Promise<Uint8Array | null> {
     const cacheKey = `${streamId}:${key}`;
+
+    // 1. Check instance-local write-through cache
     const cached = this.kvCache.get(cacheKey);
     if (cached !== undefined) return cached;
 
-    const keyBytes = Uint8Array.from(Buffer.from(key, 'utf-8'));
-    const b64Key = Buffer.from(keyBytes).toString('base64');
-    const value: any = await this.kvClient.getValue(streamId, b64Key as any);
-    if (value == null) return null;
-    const data = typeof value === 'string' ? value : value.data;
-    if (data == null || data === '') return null;
-    const bytes = Buffer.from(data, 'base64');
-    this.kvCache.set(cacheKey, bytes);
-    return bytes;
+    // 2. If KV is down, check process-level shared map (cross-agent fallback)
+    if (this.kvNodeDown || StorageClient.sharedKv.has(cacheKey)) {
+      return StorageClient.sharedKv.get(cacheKey) ?? null;
+    }
+
+    try {
+      const keyBytes = Uint8Array.from(Buffer.from(key, 'utf-8'));
+      const b64Key = Buffer.from(keyBytes).toString('base64');
+      const value: any = await this.kvClient.getValue(streamId, b64Key as any);
+      if (value == null) return null;
+      const data = typeof value === 'string' ? value : value.data;
+      if (data == null || data === '') return null;
+      const bytes = Buffer.from(data, 'base64');
+      this.kvCache.set(cacheKey, bytes);
+      StorageClient.sharedKv.set(cacheKey, bytes);
+      return bytes;
+    } catch (e: any) {
+      if (this.isNetworkError(e)) {
+        if (!this.kvNodeDown) {
+          console.warn('[ZeroMem] KV node unreachable — falling back to process-level shared KV (session only).');
+          this.kvNodeDown = true;
+        }
+        return StorageClient.sharedKv.get(cacheKey) ?? null;
+      }
+      throw e;
+    }
   }
 
-  /** KV write — on-chain transaction (3 retries) */
+  /** KV write — on-chain transaction with shared in-memory fallback when node is down */
   async kvSet(streamId: string, pairs: Array<{ key: string; value: Uint8Array }>): Promise<void> {
-    return withRetry(() => this._kvSet(streamId, pairs));
+    // Always update both caches immediately (instance + process-level shared)
+    for (const { key, value } of pairs) {
+      const cacheKey = `${streamId}:${key}`;
+      this.kvCache.set(cacheKey, value);
+      StorageClient.sharedKv.set(cacheKey, value);
+    }
+
+    if (this.kvNodeDown) return;
+
+    try {
+      await withRetry(() => this._kvSet(streamId, pairs), 2, 200);
+    } catch (e: any) {
+      if (this.isNetworkError(e)) {
+        if (!this.kvNodeDown) {
+          console.warn('[ZeroMem] KV write failed — shared in-memory fallback active.');
+          this.kvNodeDown = true;
+        }
+        return;
+      }
+      throw e;
+    }
+  }
+
+  private isNetworkError(e: any): boolean {
+    const code = e?.code ?? e?.cause?.code ?? '';
+    const msg = (e?.message ?? '').toLowerCase();
+    return code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'ETIMEDOUT' ||
+      msg.includes('econnrefused') || msg.includes('enotfound') ||
+      msg.includes('etimedout') || msg.includes('network') ||
+      // AxiosError with empty message is always a network issue
+      (e?.constructor?.name === 'AxiosError' && !e.message);
+  }
+
+  private async _origKvSet(streamId: string, pairs: Array<{ key: string; value: Uint8Array }>): Promise<void> {
+    return this._kvSet(streamId, pairs);
   }
 
   private async _kvSet(streamId: string, pairs: Array<{ key: string; value: Uint8Array }>): Promise<void> {

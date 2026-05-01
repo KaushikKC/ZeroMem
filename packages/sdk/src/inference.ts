@@ -97,10 +97,12 @@ export class InferenceClient {
       }
     }
 
-    // Fallback: lightweight local embedding via @xenova/transformers if available
+    // Fallback: lightweight local embedding via @xenova/transformers if available.
+    // Use new Function() to force a real ESM dynamic import — TypeScript compiles
+    // import() to require() in CJS output, which breaks ESM-only packages.
     try {
-      // webpackIgnore tells Next.js bundler to skip this optional dep
-      const { pipeline } = await import(/* webpackIgnore: true */ '@xenova/transformers' as any);
+      const esmImport = new Function('m', 'return import(m)');
+      const { pipeline } = await esmImport('@xenova/transformers');
       const extractor = await pipeline(
         'feature-extraction',
         'Xenova/all-MiniLM-L6-v2'

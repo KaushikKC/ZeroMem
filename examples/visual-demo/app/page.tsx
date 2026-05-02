@@ -122,6 +122,7 @@ export default function Home() {
   const [searchOpts, setSearchOpts] = useState({ since: '', minScore: '', tags: '' });
   const [recallHits, setRecallHits] = useState<Hit[]>([]);
   const [askHits, setAskHits] = useState<Hit[]>([]);
+  const [askNs, setAskNs] = useState('');
   const [searchHits, setSearchHits] = useState<Hit[]>([]);
   const [answer, setAnswer] = useState('');
   const [forgetId, setForgetId] = useState('');
@@ -271,10 +272,11 @@ return { summary: lines.slice(0, 3).join(' | ') };`);
       </Card>
 
       <Card title="mem.ask() — RAG answer from memories">
+        <Input value={askNs} onChange={setAskNs} placeholder="Namespace (default)" />
         <div className="flex gap-2">
           <Input value={question} onChange={v => { setQuestion(v); setAskHits([]); setAnswer(''); }} placeholder="Ask a question…" />
           <Btn color="purple" onClick={async () => {
-            const d = await call('ask', { question, k: 5 });
+            const d = await call('ask', { question, k: 5, ns: askNs || undefined });
             setAnswer(d.answer ?? '');
             setAskHits(d.hits ?? []);
           }} disabled={loading || !question.trim()}>ask()</Btn>
@@ -864,12 +866,23 @@ return { summary: lines.slice(0, 3).join(' | ') };`);
         <div className="ml-auto flex items-center gap-3 text-xs">
           {loading && <span className="text-yellow-400 animate-pulse">● working…</span>}
           {walletAddr && (
-            <span
-              className="text-gray-400 font-mono cursor-pointer hover:text-green-400"
-              title={`Wallet: ${walletAddr}\nPubKey: ${walletPubKey}\nClick to copy address`}
-              onClick={() => navigator.clipboard?.writeText(walletAddr)}
-            >
-              {walletAddr.slice(0, 6)}…{walletAddr.slice(-4)}
+            <span className="flex items-center gap-1">
+              <span
+                className="text-gray-400 font-mono cursor-pointer hover:text-green-400"
+                title="Click to copy address"
+                onClick={() => navigator.clipboard?.writeText(walletAddr)}
+              >
+                {walletAddr.slice(0, 6)}…{walletAddr.slice(-4)}
+              </span>
+              {walletPubKey && (
+                <span
+                  className="text-gray-600 font-mono cursor-pointer hover:text-blue-400 text-xs"
+                  title={`Click to copy pubkey: ${walletPubKey}`}
+                  onClick={() => navigator.clipboard?.writeText(walletPubKey)}
+                >
+                  [{walletPubKey.slice(0, 6)}…]
+                </span>
+              )}
             </span>
           )}
           {kvMode === 'in-memory' && (

@@ -75,6 +75,9 @@ export async function createZeroMemPlugin(
     kvUrl: resolveEnv(raw.kvUrl),
     postgresUrl: resolveEnv(raw.postgresUrl),
     grantRegistryAddress: resolveEnv(raw.grantRegistryAddress),
+    openrouterApiKey: resolveEnv(raw.openrouterApiKey),
+    openrouterModel: resolveEnv(raw.openrouterModel),
+    openrouterBaseUrl: resolveEnv(raw.openrouterBaseUrl),
   });
 
   const cfg = {

@@ -9,6 +9,9 @@ export interface ZeroMemPluginConfig {
   kvUrl?: string;
   postgresUrl?: string;
   grantRegistryAddress?: string;
+  openrouterApiKey?: string;
+  openrouterModel?: string;
+  openrouterBaseUrl?: string;
 
   autoRecall?: boolean;
   autoCapture?: boolean;
@@ -19,13 +22,16 @@ export interface ZeroMemPluginConfig {
 
 export interface PluginContext {
   mem: ZeroMem;
-  cfg: Required<Omit<ZeroMemPluginConfig, 'agentId' | 'rpc' | 'indexer' | 'kvUrl' | 'postgresUrl' | 'grantRegistryAddress'>> & {
+  cfg: Required<Omit<ZeroMemPluginConfig, 'agentId' | 'rpc' | 'indexer' | 'kvUrl' | 'postgresUrl' | 'grantRegistryAddress' | 'openrouterApiKey' | 'openrouterModel' | 'openrouterBaseUrl'>> & {
     agentId?: string;
     rpc?: string;
     indexer?: string;
     kvUrl?: string;
     postgresUrl?: string;
     grantRegistryAddress?: string;
+    openrouterApiKey?: string;
+    openrouterModel?: string;
+    openrouterBaseUrl?: string;
   };
 }
 

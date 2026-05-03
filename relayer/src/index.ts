@@ -42,7 +42,10 @@ async function getInstance(agentId: string, branch = 'main'): Promise<ZeroMem> {
     computeProviderAddress: process.env.ZG_COMPUTE_PROVIDER,
     computeEndpoint: process.env.ZG_COMPUTE_ENDPOINT,
     grantRegistryAddress: process.env.GRANT_REGISTRY_ADDRESS,
-  });
+    openrouterApiKey: process.env.OPENROUTER_API_KEY ?? process.env.OPENAI_API_KEY,
+    openrouterModel: process.env.OPENROUTER_MODEL ?? process.env.LLM_MODEL,
+    openrouterBaseUrl: process.env.OPENAI_API_BASE,
+  } as any);
 
   instances.set(key, mem);
   return mem;

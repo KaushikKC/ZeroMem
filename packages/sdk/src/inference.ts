@@ -6,6 +6,12 @@ export interface InferenceConfig {
   endpoint?: string;
   rpcUrl?: string;
   privateKey: string;
+  /** OpenRouter API key — when set, chat() routes to OpenRouter instead of 0G Compute */
+  openrouterApiKey?: string;
+  /** OpenRouter model id (default 'openai/gpt-4o-mini') */
+  openrouterModel?: string;
+  /** OpenRouter base URL (default 'https://openrouter.ai/api/v1') */
+  openrouterBaseUrl?: string;
 }
 
 interface ChatMessage {
@@ -55,14 +61,33 @@ export class InferenceClient {
     return this.config.endpoint ?? '';
   }
 
-  /** Call 0G Compute chat completions */
+  /** Chat completion — OpenAI-compatible (OpenRouter) if openrouterApiKey set, else 0G Compute */
   async chat(
     messages: ChatMessage[],
-    model = 'qwen-2.5-7b-instruct'
+    modelOverride?: string
   ): Promise<string> {
+    if (this.config.openrouterApiKey) {
+      const baseUrl = this.config.openrouterBaseUrl ?? 'https://openrouter.ai/api/v1';
+      const model = modelOverride ?? this.config.openrouterModel ?? 'openai/gpt-4o-mini';
+      const resp = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.config.openrouterApiKey}`,
+          'HTTP-Referer': 'https://github.com/zeromem',
+          'X-Title': 'ZeroMem',
+        },
+        body: JSON.stringify({ model, messages, temperature: 0.7 }),
+      });
+      if (!resp.ok) throw new Error(`LLM error (${resp.status}): ${await resp.text()}`);
+      const json = (await resp.json()) as any;
+      return (json.choices?.[0]?.message?.content ?? '').trim();
+    }
+
     if (!this.endpoint()) {
       throw new Error('NO_INFERENCE_ENDPOINT');
     }
+    const model = modelOverride ?? 'qwen-2.5-7b-instruct';
     const headers = await this.getHeaders();
     const resp = await fetch(`${this.endpoint()}/chat/completions`, {
       method: 'POST',

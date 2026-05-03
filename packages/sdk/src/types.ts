@@ -167,12 +167,18 @@ export interface ZeroMemConfig {
   computeProviderAddress?: string;
   computeEndpoint?: string;
   grantRegistryAddress?: string;
+  /** OpenRouter API key — when set, ask/plan/reflect use OpenRouter instead of 0G Compute */
+  openrouterApiKey?: string;
+  /** OpenRouter model id (default 'openai/gpt-4o-mini') */
+  openrouterModel?: string;
+  /** OpenAI-compatible base URL (default 'https://openrouter.ai/api/v1') */
+  openrouterBaseUrl?: string;
 }
 
 export const DEFAULTS = {
   RPC_URL: 'https://evmrpc-testnet.0g.ai',
   INDEXER_URL: 'https://indexer-storage-testnet-turbo.0g.ai',
-  KV_URL: 'http://3.101.147.150:6789',
+  KV_URL: 'http://localhost:6789',
   FLOW_CONTRACT: '0x22E03a6A89B950F1c82ec5e74F8eCa321a105296',
   CHAIN_ID: 16602,
   EMBEDDING_DIM: 384,

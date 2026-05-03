@@ -135,7 +135,7 @@ export class StorageClient {
     const memData = new MemData(data);
 
     const sdk: any = await import('@0gfoundation/0g-ts-sdk');
-    const { Uploader, FixedPriceFlow__factory, mergeUploadOptions } = sdk;
+    const { Uploader, FixedPriceFlow__factory, mergeUploadOptions, calculatePrice, getMarketContract } = sdk;
 
     const uploadOpts: Record<string, unknown> = {};
     if (opts.encrypt && opts.recipientPubKey) {
@@ -146,8 +146,54 @@ export class StorageClient {
       : { expectedReplica: 1, taskSize: 1, finalityRequired: false, fragmentSize: 4 * 1024 * 1024 * 1024, skipIfFinalized: true, ...uploadOpts };
 
     const nodes = await this.healthyNodes();
-    const flow = FixedPriceFlow__factory.connect(this.flowContract, this.signer);
-    const uploader = new Uploader(nodes, this.rpcUrl, flow);
+
+    // Use the live flowAddress reported by the storage node (matches official Indexer.upload behaviour).
+    // Falls back to the configured address if the node doesn't report one.
+    let flowAddress = this.flowContract;
+    try {
+      const nodeStatus: any = await nodes[0].getStatus();
+      if (nodeStatus?.networkIdentity?.flowAddress) {
+        flowAddress = nodeStatus.networkIdentity.flowAddress;
+      }
+    } catch { /* use configured default */ }
+
+    const flow = FixedPriceFlow__factory.connect(flowAddress, this.signer);
+
+    // Pre-flight: check balance covers fee + realistic gas cost (500K gas @ current price).
+    // This surfaces a clear error instead of the cryptic "require(false)" that appears when
+    // ethers internally eth_call's with a 50M gas default and the balance check fails.
+    try {
+      const marketAddr = await flow.market();
+      const market = getMarketContract(marketAddr, this.signer.provider);
+      const pricePerSector = await market.pricePerSector();
+      const [submission] = await memData.createSubmission('0x', this.signer.address);
+      if (submission) {
+        const fee: bigint = calculatePrice(submission, pricePerSector);
+        const feeData = await this.signer.provider!.getFeeData();
+        const gasPrice: bigint = feeData.gasPrice ?? 4_000_000_000n;
+        const GAS_BUDGET = 500_000n;
+        const required = fee + gasPrice * GAS_BUDGET;
+        const balance: bigint = await this.signer.provider!.getBalance(this.signer.address);
+        if (balance < required) {
+          throw new Error(
+            `Insufficient balance for 0G upload. ` +
+            `Have ${balance} wei (${(Number(balance) / 1e18).toFixed(8)} ETH), ` +
+            `need ~${required} wei (${(Number(required) / 1e18).toFixed(8)} ETH) ` +
+            `[fee=${fee} + ${GAS_BUDGET} gas x ${gasPrice} gasPrice]. ` +
+            `Fund wallet ${this.signer.address} with testnet ETH from https://faucet.0g.ai`
+          );
+        }
+      }
+    } catch (e: any) {
+      if (e.message?.includes('Insufficient balance')) throw e;
+      // Non-balance errors (e.g. node unreachable) — let upload attempt proceed
+      console.warn('pre-flight check skipped:', e.message);
+    }
+
+    // Set explicit gasLimit so ethers doesn't estimateGas with the 50M default,
+    // which causes a spurious "insufficient funds" failure during estimation.
+    const SUBMIT_GAS_LIMIT = 500_000n;
+    const uploader = new Uploader(nodes, this.rpcUrl, flow, BigInt(0), SUBMIT_GAS_LIMIT);
 
     /** SDK bug: waitForLogEntry breaks on the first null node instead of trying all nodes.
      *  With sharded storage (numShard=2), node[0] may not hold the shard for this blob,

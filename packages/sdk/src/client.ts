@@ -53,7 +53,7 @@ import {
 export interface RememberOpts {
   ns?: string;
   tags?: string[];
-  /** Skip write if a memory with cosine similarity ≥ threshold already exists (default 0.95) */
+  /** Skip write if a memory with cosine similarity >= threshold already exists (default 0.95) */
   dedupe?: boolean;
   dedupeThreshold?: number;
 }
@@ -114,6 +114,9 @@ export class ZeroMem {
       rpcUrl: config.rpcUrl,
       providerAddress: config.computeProviderAddress,
       endpoint: config.computeEndpoint,
+      openrouterApiKey: config.openrouterApiKey,
+      openrouterModel: config.openrouterModel,
+      openrouterBaseUrl: config.openrouterBaseUrl,
     });
 
     this.grants = new GrantManager(
